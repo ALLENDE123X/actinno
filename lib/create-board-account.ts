@@ -34,6 +34,8 @@ import {
   ApifyMcpError,
   ApifyMcpSession,
   PlaywrightBrowser,
+  type NavigateResult,
+  type NavigateWaitUntil,
 } from "./apify-mcp-client.js";
 
 /** Project ref this module is allowed to write to. */
@@ -235,7 +237,15 @@ var clickable = Array.prototype.slice.call(
   document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button]')
 );
 var texts = clickable.map(textOf).filter(function (t) { return t.length > 0 && t.length < 60; });
-function uniq(list) { return Array.prototype.slice.call(new Set(list)); }
+// Array.from, NOT Array.prototype.slice.call: a Set has .size and no .length,
+// so slice reads length as undefined and returns [] for every input. That made
+// authTexts/applyTexts/submitTexts silently empty on every page ever probed —
+// invisible on Greenhouse, whose form is inline (the "click Apply first" branch
+// is skipped and the gate verdict comes from the rendered fields), and a false
+// DIRECT APPLY on Workday, whose listing page carries only an "Apply" button.
+// Verified against the real Salesforce listing: the same probe that reported
+// applyTexts: [] had "Apply" and "Sign In" among its 18 clickables.
+function uniq(list) { return Array.from(new Set(list)); }
 
 // Read once and reuse: innerText forces a layout pass, and two reads of it in
 // one probe could disagree with each other on a page that is still settling.
@@ -362,6 +372,27 @@ const MIN_RENDERED_TEXT_CHARS = 200;
  * materially bigger change than this file's fail-closed-on-emptiness stance.
  */
 function assertProbeRendered(probe: PageProbe): void {
+  const symptoms = renderSymptoms(probe);
+  if (symptoms.length === 0) return;
+
+  throw new Error(
+    `Page probe reported the correct URL ("${probe.url}") but ${symptoms.join(" and ")}. ` +
+      `That is a browser that did not render the page, not a board without an account gate ` +
+      `— refusing to draw a gate verdict from it.`
+  );
+}
+
+/**
+ * The evidence `assertProbeRendered` refuses on, as data instead of an
+ * exception. Empty means "this page rendered".
+ *
+ * Split out so the settle step in `navigateAndProbe` can ask *whether* a page
+ * has rendered yet — a question with a legitimate "not yet, wait and re-ask"
+ * answer during initial load — without either duplicating the emptiness rules
+ * or catching an exception as control flow. There is deliberately exactly one
+ * definition of "unrendered" in this module, and this is it.
+ */
+function renderSymptoms(probe: PageProbe): string[] {
   // Anything at all the visitor could interact with. Deliberately wider than
   // the gate signals: an iframe or a stray link is thin evidence of a real
   // page, but zero of *any* of these is conclusive evidence against one.
@@ -392,24 +423,29 @@ function assertProbeRendered(probe: PageProbe): void {
     );
   }
 
-  if (symptoms.length === 0) return;
+  return symptoms;
+}
 
-  throw new Error(
-    `Page probe reported the correct URL ("${probe.url}") but ${symptoms.join(" and ")}. ` +
-      `That is a browser that did not render the page, not a board without an account gate ` +
-      `— refusing to draw a gate verdict from it.`
-  );
+/**
+ * Runs the probe and validates its *shape*. Says nothing about whether the page
+ * rendered — only `settleAfterLoad`, which needs to re-ask that question, is
+ * allowed to stop here. Everything else goes through `probePage`.
+ */
+async function probeShape(browser: PlaywrightBrowser): Promise<PageProbe> {
+  const raw = await browser.evaluate<unknown>(PAGE_PROBE_SCRIPT);
+  assertProbeShape(raw);
+  return raw;
 }
 
 /** Runs the probe and validates it in one step. */
 async function probePage(browser: PlaywrightBrowser): Promise<PageProbe> {
-  const raw = await browser.evaluate<unknown>(PAGE_PROBE_SCRIPT);
-  assertProbeShape(raw);
+  const probe = await probeShape(browser);
   // Called here rather than at each call site so every probe in this module is
   // covered by construction — `navigateAndProbe` and `reprobeAfterInteraction`
-  // both route through this function, and a future third caller will too.
-  assertProbeRendered(raw);
-  return raw;
+  // both route through this function (the former via its own terminal
+  // `assertProbeRendered`), and a future third caller will too.
+  assertProbeRendered(probe);
+  return probe;
 }
 
 /** Compares URLs by origin + path — query/hash churn is not a different page. */
@@ -426,8 +462,91 @@ function samePage(a: string, b: string): boolean {
   }
 }
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * Navigates and probes, refusing to return a probe of the wrong page.
+ * Cheap lifecycle for the first navigation attempt, patient one for the retry.
+ * See `NavigateWaitUntil` in `apify-mcp-client.ts` for why this is escalated
+ * rather than simply set to the patient value: `networkidle` is the better
+ * answer for a client-rendered board and the worse answer for any site that
+ * polls or beacons forever, and only the page itself can tell us which it is.
+ */
+const FAST_WAIT_UNTIL: NavigateWaitUntil = "domcontentloaded";
+const PATIENT_WAIT_UNTIL: NavigateWaitUntil = "networkidle";
+
+/**
+ * What "the page mounted something" looks like without knowing the board.
+ *
+ * `attached` rather than `visible` is deliberate: Playwright resolves a
+ * selector list non-strictly, i.e. it waits on the *first* match only, so a
+ * hidden first match (a skip link, a collapsed nav button) would leave a
+ * visibility wait pending on a page that has in fact rendered. Attachment is
+ * the weaker claim, which is the right one here — this wait is a trigger to
+ * stop waiting, not evidence of anything. `renderSymptoms` still has to agree
+ * afterwards, so a premature hit costs one probe and nothing else.
+ */
+const RENDERED_CONTENT_SELECTOR = "main, [role='main'], form, h1, button, a[href]";
+
+/** Budget for that wait. Comfortably inside the Actor's 45s per-call ceiling. */
+const SETTLE_SELECTOR_TIMEOUT_MS = 20_000;
+
+/**
+ * Delays between re-probes when the page still looks unrendered. Each entry
+ * costs one extra `evaluate` round-trip, so this is short and finite: a page
+ * that has not painted anything ~10s after its content selector attached is
+ * not going to.
+ */
+const SETTLE_PROBE_BACKOFF_MS: readonly number[] = [1_500, 3_000, 5_000];
+
+/**
+ * Gives a client-rendered page a bounded chance to actually render before
+ * anything judges it.
+ *
+ * Why this exists: `navigate` with `domcontentloaded` returns when the HTML is
+ * parsed, which on a heavy SPA (Workday's careers site is the case that forced
+ * this) is well before the framework has fetched its data and mounted the page.
+ * The very next `evaluate` then reads a shell — 0 characters of text, empty
+ * title, no interactive elements — and `assertProbeRendered` correctly refuses
+ * to judge it. Correct, but premature: nobody had actually waited for the page.
+ *
+ * So: wait for *some* content to attach, then probe, and re-probe a few times
+ * while the probe still reports an empty page. Returns the last probe either
+ * way — deciding what an unrendered page means is the caller's job, and the
+ * answer is still "fail closed".
+ */
+async function settleAfterLoad(browser: PlaywrightBrowser): Promise<PageProbe> {
+  const missed = await browser.waitForQuietly(
+    RENDERED_CONTENT_SELECTOR,
+    "attached",
+    SETTLE_SELECTOR_TIMEOUT_MS
+  );
+  // Not fatal, and not even necessarily wrong — the probe below is the actual
+  // measurement. Logged because "no content attached in 20s" is the single most
+  // useful line in the transcript when this page turns out to be unreadable.
+  if (missed) {
+    console.warn(
+      `[act-005] nothing matching "${RENDERED_CONTENT_SELECTOR}" attached within ` +
+        `${SETTLE_SELECTOR_TIMEOUT_MS}ms: ${missed}`
+    );
+  }
+
+  let probe = await probeShape(browser);
+  for (const delayMs of SETTLE_PROBE_BACKOFF_MS) {
+    const symptoms = renderSymptoms(probe);
+    if (symptoms.length === 0) return probe;
+    console.warn(
+      `[act-005] page has not rendered yet (${symptoms.join("; ")}); re-probing in ${delayMs}ms`
+    );
+    await sleep(delayMs);
+    probe = await probeShape(browser);
+  }
+  return probe;
+}
+
+/**
+ * Navigates and probes, refusing to return a probe of the wrong page — or of a
+ * page that never rendered.
  *
  * This guard exists because it fired in practice. `navigate` returned Discord's
  * real URL and title, and the very next `evaluate` — a separate billed
@@ -445,33 +564,79 @@ function samePage(a: string, b: string): boolean {
  * One re-navigation is allowed, because this is a transient property of a
  * third-party Actor rather than a problem with the target site. Beyond that it
  * fails loudly: reporting no verdict is correct, guessing one is not.
+ *
+ * The same one retry now also covers the *unrendered* page, via
+ * `settleAfterLoad` above, and spends it differently: the second attempt
+ * navigates with `networkidle` instead of `domcontentloaded`. Only two things
+ * can be wrong at this point — either the browser was lost (a re-navigation
+ * fixes it) or the page needed longer than the cheap lifecycle allowed (a
+ * patient one fixes it) — and one re-navigation addresses both.
  */
 async function navigateAndProbe(
   browser: PlaywrightBrowser,
   applyUrl: string,
-  attemptsLeft = 1
+  attemptsLeft = 1,
+  waitUntil: NavigateWaitUntil = FAST_WAIT_UNTIL
 ): Promise<PageProbe> {
-  console.log(`[act-005] navigate → ${applyUrl}`);
-  const nav = await browser.navigate(applyUrl);
+  console.log(`[act-005] navigate → ${applyUrl} (wait_until=${waitUntil})`);
+  const nav = await navigateTolerantly(browser, applyUrl, waitUntil);
   console.log(`[act-005] landed on ${nav.url} — "${nav.title}"`);
 
-  const probe = await probePage(browser);
-
+  const probe = await settleAfterLoad(browser);
+  const symptoms = renderSymptoms(probe);
   // Match against what `navigate` actually reported, not the requested URL, so
   // a legitimate board-side redirect is accepted while a lost page is not.
-  if (samePage(probe.url, nav.url)) return probe;
+  const lostPage = !samePage(probe.url, nav.url);
+  if (!lostPage && symptoms.length === 0) return probe;
 
-  const complaint =
-    `probe ran against "${probe.url}" but navigation had landed on "${nav.url}" — ` +
-    `the shared Actor browser lost the page between calls`;
+  const complaint = lostPage
+    ? `probe ran against "${probe.url}" but navigation had landed on "${nav.url}" — ` +
+      `the shared Actor browser lost the page between calls`
+    : `the page at "${probe.url}" had still not rendered after waiting for it: ` +
+      symptoms.join(" and ");
 
   if (attemptsLeft > 0) {
-    console.warn(`[act-005] ${complaint}; re-navigating once`);
-    return await navigateAndProbe(browser, applyUrl, attemptsLeft - 1);
+    console.warn(
+      `[act-005] ${complaint}; re-navigating once with wait_until=${PATIENT_WAIT_UNTIL}`
+    );
+    return await navigateAndProbe(browser, applyUrl, attemptsLeft - 1, PATIENT_WAIT_UNTIL);
   }
+
+  // Terminal, and fail-closed either way. `assertProbeRendered` owns the
+  // wording for the unrendered case and throws on exactly the symptoms above,
+  // so only the lost-page case reaches the throw below it.
+  assertProbeRendered(probe);
   throw new Error(
     `${complaint}. Refusing to report a gate verdict for a page that was never inspected.`
   );
+}
+
+/**
+ * `navigate`, downgrading to the cheap lifecycle if the patient one fails.
+ *
+ * `networkidle` is the escalation that never arrives on a site with a polling
+ * XHR or a chatty analytics beacon: Playwright gives up and `navigate` comes
+ * back as an Actor error. Falling back keeps that experiment strictly
+ * non-destructive — a failed escalation must leave us no worse off than the
+ * `domcontentloaded`-only behaviour it replaced, not abort the whole run.
+ */
+async function navigateTolerantly(
+  browser: PlaywrightBrowser,
+  applyUrl: string,
+  waitUntil: NavigateWaitUntil
+): Promise<NavigateResult> {
+  if (waitUntil === FAST_WAIT_UNTIL) return await browser.navigate(applyUrl, waitUntil);
+
+  try {
+    return await browser.navigate(applyUrl, waitUntil);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[act-005] navigate with wait_until=${waitUntil} failed (${reason}); ` +
+        `falling back to wait_until=${FAST_WAIT_UNTIL}`
+    );
+    return await browser.navigate(applyUrl, FAST_WAIT_UNTIL);
+  }
 }
 
 /**
@@ -751,6 +916,15 @@ function classifyGate(probe: PageProbe): { accountGate: boolean; reasons: string
   return { accountGate: false, reasons };
 }
 
+/**
+ * How many apply-ish controls the flow will click through before giving up on
+ * reaching the application. Two covers both shapes seen in the wild — a button
+ * that reveals the form (Greenhouse-style) and a button that opens a menu whose
+ * entry reveals it (Workday) — while keeping the number of actions taken on a
+ * real employer's site to the minimum that answers the question.
+ */
+const APPLY_CLICK_ROUNDS = 2;
+
 /** Whether the application form itself is already on screen. */
 function applicationFormVisible(probe: PageProbe): boolean {
   return probe.fileInputs > 0 || probe.emailFields.length > 0;
@@ -976,8 +1150,30 @@ async function runBrowserFlow(
     // a description, the form (and any gate behind it) appears after Apply.
     // Skipped when the form is already on screen — no reason to click anything
     // on a live employer's site that we do not need to.
-    if (!verdict.accountGate && !applicationFormVisible(probe) && probe.applyTexts.length > 0) {
-      const applyLabel = probe.applyTexts[0]!;
+    //
+    // Rounds, rather than a single click, because one is not always enough:
+    // Workday's "Apply" opens a *menu* ("Apply Manually", "Autofill with
+    // Resume") and it is the menu entry that reaches the application. Stopping
+    // after the first click left the run staring at an open menu with no form
+    // and no password field, i.e. a confident — and wrong — DIRECT APPLY on a
+    // board that does gate applications. Verified against the real Salesforce
+    // Workday listing.
+    //
+    // Only labels the probe already classified as apply-ish are ever clicked
+    // (`APPLY_RE` anchors on a leading "apply"), which is what keeps
+    // "Autofill with Resume" and "Use My Last Application" — controls that
+    // would upload a document or submit a prior application — out of reach.
+    const clickedApplyLabels = new Set<string>();
+    const flowNotes: string[] = [];
+
+    for (let round = 0; round < APPLY_CLICK_ROUNDS; round++) {
+      if (verdict.accountGate || applicationFormVisible(probe)) break;
+      // A label already clicked is not a next step — on a menu, clicking it
+      // again just closes what the last click opened.
+      const applyLabel = probe.applyTexts.find((text) => !clickedApplyLabels.has(text));
+      if (applyLabel === undefined) break;
+      clickedApplyLabels.add(applyLabel);
+
       console.log(`[act-005] no inline form yet — clicking "${applyLabel}" to start the flow`);
       await browser.click({ text: applyLabel });
 
@@ -1000,8 +1196,12 @@ async function runBrowserFlow(
       }
       probe = started.probe;
       verdict = classifyGate(probe);
-      verdict.reasons.unshift(`re-probed after clicking "${applyLabel}" — ${started.note}`);
+      flowNotes.push(`re-probed after clicking "${applyLabel}" — ${started.note}`);
     }
+    // Applied once, after the loop: `classifyGate` returns a fresh reasons array
+    // each round, so notes pushed onto an earlier round's verdict would be
+    // dropped by the next one.
+    verdict.reasons.unshift(...flowNotes);
 
     console.log(
       `[act-005] gate verdict: ${verdict.accountGate ? "ACCOUNT REQUIRED" : "DIRECT APPLY"}`

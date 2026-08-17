@@ -221,11 +221,34 @@ function parseToolPayload<T>(text: string, qualifiedTool: string): T {
 
 export type NavigateResult = { url: string; title: string };
 
+/**
+ * Playwright's `page.goto` lifecycle values, which the Actor's `navigate` tool
+ * passes straight through as `wait_until` (verified against its input schema:
+ * a plain string with a `"domcontentloaded"` default, no enum).
+ *
+ * The choice is a real tradeoff, not a detail:
+ *  - `domcontentloaded` returns as soon as the HTML is parsed. Fast and it can
+ *    never hang, but on a client-rendered SPA it returns while the page is
+ *    still an empty shell — a subsequent `evaluate` then reads a page with no
+ *    text, no title and no interactive elements.
+ *  - `networkidle` waits for the network to go quiet, which is the closest
+ *    generic proxy for "the framework finished fetching and mounting". It is
+ *    also the one that can cost the full navigation timeout on any site that
+ *    polls or beacons continuously, and Playwright itself discourages it.
+ *
+ * Callers should therefore default to `domcontentloaded` and escalate only
+ * when the cheap path demonstrably produced an unrendered page.
+ */
+export type NavigateWaitUntil = "load" | "domcontentloaded" | "networkidle" | "commit";
+
 export class PlaywrightBrowser {
   constructor(private readonly session: ApifyMcpSession) {}
 
   /** Navigation gets the full 45s budget — a cold standby start is slow. */
-  async navigate(url: string, waitUntil = "domcontentloaded"): Promise<NavigateResult> {
+  async navigate(
+    url: string,
+    waitUntil: NavigateWaitUntil = "domcontentloaded"
+  ): Promise<NavigateResult> {
     return await this.session.callActorTool<NavigateResult>(
       PLAYWRIGHT_MCP_ACTOR,
       "navigate",
@@ -288,6 +311,29 @@ export class PlaywrightBrowser {
       { selector, state, timeout },
       MAX_WAIT_SECS
     );
+  }
+
+  /**
+   * `waitFor` for the case where the selector never appearing is an *answer*
+   * rather than a failure — "give the page a chance to show X, then carry on
+   * either way". Returns undefined when the wait succeeded, or the failure
+   * message when it did not.
+   *
+   * Separate from `waitFor` rather than a flag on it because the two have
+   * genuinely different contracts: waiting for a field you are about to type
+   * into must throw when it never arrives, and swallowing that would be a bug.
+   */
+  async waitForQuietly(
+    selector: string,
+    state = "visible",
+    timeout = 10_000
+  ): Promise<string | undefined> {
+    try {
+      await this.waitFor(selector, state, timeout);
+      return undefined;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
   }
 
   /**
