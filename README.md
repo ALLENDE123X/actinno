@@ -19,7 +19,8 @@ automation.
 - [x] ACT-002: Bulk-search-job-listings wired to real Greenhouse actor
 - [x] ACT-003: Candidate intake — resume upload + candidate row
 - [x] ACT-004: Per-board unique password generator
-- [ ] ACT-005 through ACT-011: see GitHub Issues
+- [x] ACT-005: Playwright account creation on job board
+- [ ] ACT-006 through ACT-011: see GitHub Issues
 
 ## Infra already provisioned
 
