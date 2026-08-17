@@ -32,10 +32,12 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { generateBoardPassword } from "./generate-board-password.js";
 import {
   ApifyMcpError,
-  ApifyMcpSession,
   PlaywrightBrowser,
+  isSessionLostError,
+  openPlaywrightSession,
   type NavigateResult,
   type NavigateWaitUntil,
+  type PlaywrightSession,
 } from "./apify-mcp-client.js";
 
 /** Project ref this module is allowed to write to. */
@@ -429,23 +431,13 @@ function renderSymptoms(probe: PageProbe): string[] {
 /**
  * Runs the probe and validates its *shape*. Says nothing about whether the page
  * rendered — only `settleAfterLoad`, which needs to re-ask that question, is
- * allowed to stop here. Everything else goes through `probePage`.
+ * allowed to stop here. Everything else goes through `settleAndProbe`, which
+ * adds the render assertion once the page has been given time to render.
  */
 async function probeShape(browser: PlaywrightBrowser): Promise<PageProbe> {
   const raw = await browser.evaluate<unknown>(PAGE_PROBE_SCRIPT);
   assertProbeShape(raw);
   return raw;
-}
-
-/** Runs the probe and validates it in one step. */
-async function probePage(browser: PlaywrightBrowser): Promise<PageProbe> {
-  const probe = await probeShape(browser);
-  // Called here rather than at each call site so every probe in this module is
-  // covered by construction — `navigateAndProbe` and `reprobeAfterInteraction`
-  // both route through this function (the former via its own terminal
-  // `assertProbeRendered`), and a future third caller will too.
-  assertProbeRendered(probe);
-  return probe;
 }
 
 /** Compares URLs by origin + path — query/hash churn is not a different page. */
@@ -545,6 +537,32 @@ async function settleAfterLoad(browser: PlaywrightBrowser): Promise<PageProbe> {
 }
 
 /**
+ * `probePage` for a page reached by clicking rather than by navigating.
+ *
+ * A click on a single-page ATS is a navigation the browser never tells us
+ * about: `navigate` has a lifecycle to wait on, a click has nothing, so the
+ * probe that follows it runs whenever the click's round-trip happens to return.
+ * On Workday that is well inside the route change — verified live against the
+ * Salesforce listing, where clicking "Apply Manually" landed the browser on the
+ * correct `/apply/applyManually` URL and the immediate probe read a body with
+ * zero characters of text and not one link, button, form or input in it.
+ *
+ * `assertProbeRendered` refused that probe, which was the right call on the
+ * evidence and the wrong outcome for the run: the page was not broken, it was
+ * two seconds old. Giving a clicked-to page exactly the settle a navigated-to
+ * page already gets is the fix, and it is a strictly more patient one — every
+ * check still runs, on a probe taken later. Nothing here can turn an unrendered
+ * page into an accepted one; `settleAfterLoad` re-probes while the page still
+ * looks empty and hands back the last probe either way, and the assertion below
+ * is the same terminal one as before.
+ */
+async function settleAndProbe(browser: PlaywrightBrowser): Promise<PageProbe> {
+  const probe = await settleAfterLoad(browser);
+  assertProbeRendered(probe);
+  return probe;
+}
+
+/**
  * Navigates and probes, refusing to return a probe of the wrong page — or of a
  * page that never rendered.
  *
@@ -630,6 +648,11 @@ async function navigateTolerantly(
   try {
     return await browser.navigate(applyUrl, waitUntil);
   } catch (err) {
+    // A dead session is not a lifecycle problem, and the cheap lifecycle is not
+    // a fix for it — retrying here would just spend a second billed call to be
+    // told the same thing. Let it out so the caller can decide about a fresh
+    // session, which is the only thing that helps.
+    if (isSessionLostError(err)) throw err;
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(
       `[act-005] navigate with wait_until=${waitUntil} failed (${reason}); ` +
@@ -818,11 +841,15 @@ async function reprobeAfterInteraction(
   before: PageProbe,
   interaction: string
 ): Promise<ReprobeOutcome> {
-  let previous = await probePage(browser);
+  // Every probe here is a settled one, not just the first: a board can start a
+  // second route change while we are measuring the first (Workday's apply flow
+  // does exactly that), and a stability pass that reads a shell mid-transition
+  // would fail the run on a page that was about to render perfectly well.
+  let previous = await settleAndProbe(browser);
   let settled: PageProbe | undefined;
 
   for (let pass = 1; pass < REPROBE_PASSES; pass++) {
-    const current = await probePage(browser);
+    const current = await settleAndProbe(browser);
     if (samePage(current.url, previous.url)) {
       settled = current;
       break;
@@ -928,6 +955,102 @@ const APPLY_CLICK_ROUNDS = 2;
 /** Whether the application form itself is already on screen. */
 function applicationFormVisible(probe: PageProbe): boolean {
   return probe.fileInputs > 0 || probe.emailFields.length > 0;
+}
+
+/**
+ * Anything on the page that could conceivably be applied or signed up *with*.
+ *
+ * Zero of these at the end of the apply flow is the case `assertProbeRendered`
+ * explicitly cannot catch and names as its own blind spot: a page whose chrome
+ * rendered fine while the application widget never mounted. It has text, a
+ * title and clickable elements, so every emptiness check passes — and then
+ * `classifyGate` finds no password field and reports a confident DIRECT APPLY
+ * for a board nobody ever saw an application on. Verified live: Salesforce's
+ * Workday listing, one second after "Apply Manually", was a 691-character page
+ * with 14 clickable elements, a correct title, and not one form, input or
+ * upload control anywhere in it.
+ *
+ * Iframes count. The probe cannot see inside one, so a board that hosts its
+ * form in an iframe (Greenhouse's embedded boards) legitimately shows no
+ * top-level inputs, and treating that as "no application here" would break the
+ * direct-apply majority this module exists to serve.
+ */
+function applyAffordanceCount(probe: PageProbe): number {
+  return (
+    probe.passwordFields.length +
+    probe.emailFields.length +
+    probe.fileInputs +
+    probe.textInputs +
+    probe.forms.length +
+    probe.iframes.length
+  );
+}
+
+/**
+ * How long to keep waiting for that widget before calling it absent. Longer and
+ * looser than `SETTLE_PROBE_BACKOFF_MS` because it is a different question: the
+ * page has already rendered, so this is waiting on a second, later mount (a
+ * modal, a lazily-loaded form) rather than on first paint. Each entry costs one
+ * probe round-trip, and the whole ladder is ~18s.
+ */
+const APPLY_UI_BACKOFF_MS: readonly number[] = [2_000, 3_000, 5_000, 8_000];
+
+/**
+ * Waits for a page that rendered without an application on it to grow one, and
+ * refuses to return if it never does.
+ *
+ * The refusal is the point. Every other outcome this module can reach says
+ * something it has evidence for; "no account required" drawn from a page with
+ * nothing to apply on says something it does not, and writes it to a real
+ * employer's row where ACT-007 will act on it.
+ */
+async function awaitApplyUi(
+  browser: PlaywrightBrowser,
+  before: PageProbe
+): Promise<{ probe: PageProbe; note: string }> {
+  let probe = before;
+  let waitedMs = 0;
+
+  for (const delayMs of APPLY_UI_BACKOFF_MS) {
+    console.warn(
+      `[act-005] "${probe.url}" rendered (${probe.textLength} chars, ${probe.clickableCount} ` +
+        `clickable) but carries no form, input, upload control or iframe — waiting ${delayMs}ms ` +
+        `for the application UI to mount`
+    );
+    await sleep(delayMs);
+    waitedMs += delayMs;
+
+    const current = await settleAndProbe(browser);
+    // Same corroboration rule as everywhere else: a probe that cannot be tied
+    // to the page we were looking at is not evidence about it.
+    if (!sameBoard(current.url, before.url)) {
+      throw new Error(
+        `While waiting for the application UI the browser moved to "${current.url}", which does ` +
+          `not belong to the same board as "${before.url}" — refusing to draw a gate verdict ` +
+          `from it.`
+      );
+    }
+    probe = current;
+    if (applyAffordanceCount(probe) > 0) {
+      return {
+        probe,
+        note:
+          `the apply page had no form or input on first read; one mounted after ${waitedMs}ms ` +
+          `of waiting`,
+      };
+    }
+  }
+
+  throw new Error(
+    `Reached "${probe.url}" at the end of the apply flow and the page is rendered ` +
+      `(${probe.textLength} characters of text, ${probe.clickableCount} clickable elements), but ` +
+      `after ${waitedMs}ms it still has no form, no text input, no email field, no file input, ` +
+      `no password field and no iframe — there is nothing on it to apply with. Reporting ` +
+      `"${APPLICATION_STATUS.NO_ACCOUNT_REQUIRED}" here would be a claim about an application ` +
+      `nobody ever saw. Auth wording on the page: ${JSON.stringify(probe.authTexts)}; ` +
+      `apply-ish controls: ${JSON.stringify(probe.applyTexts)}; ` +
+      `submit-ish controls: ${JSON.stringify(probe.submitTexts)}.`
+  );
 }
 
 /**
@@ -1132,6 +1255,124 @@ async function claimApplicationRow(
   return id;
 }
 
+type GateOutcome = {
+  probe: PageProbe;
+  verdict: { accountGate: boolean; reasons: string[] };
+};
+
+/**
+ * Everything between "open a browser" and "we know whether this board gates
+ * applications": navigate, let the page settle, click through to the
+ * application if the listing hides it, and classify what is on screen.
+ *
+ * Split out from `runBrowserFlow` because it is the part of the flow that is
+ * safe to *start over* on a different browser, which is what that function does
+ * when the Actor-side session dies underneath it.
+ * That safety is a property of what it does, and holding it in one function is
+ * what keeps it checkable: every step here either navigates, reads, or clicks a
+ * control whose label the probe already matched as apply-ish, and all of its
+ * state is re-derived from a fresh probe rather than carried in. Nothing is
+ * typed, nothing is submitted, and nothing survives it except the returned
+ * probe. Adding a step that writes to the board would silently make the restart
+ * unsafe, so such a step belongs in `createAccount`, not here.
+ */
+async function detectAccountGate(
+  browser: PlaywrightBrowser,
+  applyUrl: string
+): Promise<GateOutcome> {
+  let probe = await navigateAndProbe(browser, applyUrl);
+  let verdict = classifyGate(probe);
+
+  // "Start the application flow": on boards where the listing page only shows
+  // a description, the form (and any gate behind it) appears after Apply.
+  // Skipped when the form is already on screen — no reason to click anything
+  // on a live employer's site that we do not need to.
+  //
+  // Rounds, rather than a single click, because one is not always enough:
+  // Workday's "Apply" opens a *menu* ("Apply Manually", "Autofill with
+  // Resume") and it is the menu entry that reaches the application. Stopping
+  // after the first click left the run staring at an open menu with no form
+  // and no password field, i.e. a confident — and wrong — DIRECT APPLY on a
+  // board that does gate applications. Verified against the real Salesforce
+  // Workday listing.
+  //
+  // Only labels the probe already classified as apply-ish are ever clicked
+  // (`APPLY_RE` anchors on a leading "apply"), which is what keeps
+  // "Autofill with Resume" and "Use My Last Application" — controls that
+  // would upload a document or submit a prior application — out of reach.
+  const clickedApplyLabels = new Set<string>();
+  const flowNotes: string[] = [];
+
+  for (let round = 0; round < APPLY_CLICK_ROUNDS; round++) {
+    if (verdict.accountGate || applicationFormVisible(probe)) break;
+    // A label already clicked is not a next step — on a menu, clicking it
+    // again just closes what the last click opened.
+    const applyLabel = probe.applyTexts.find((text) => !clickedApplyLabels.has(text));
+    if (applyLabel === undefined) break;
+    clickedApplyLabels.add(applyLabel);
+
+    console.log(`[act-005] no inline form yet — clicking "${applyLabel}" to start the flow`);
+    await browser.click({ text: applyLabel });
+
+    // Same discipline as `navigateAndProbe`: a probe that cannot be tied back
+    // to the page we clicked is not evidence about what the click did, and
+    // "direct apply" drawn from a page belonging to another tenant of the
+    // shared browser is the false success this module exists to avoid.
+    // Failing here is safe to retry — nothing has been filled or submitted
+    // yet — so it throws, and `createBoardAccount` records `error` on the row.
+    const started = await reprobeAfterInteraction(browser, probe, `clicking "${applyLabel}"`);
+    if (!started.corroborated) {
+      throw new Error(
+        `Clicked "${applyLabel}" to start the application flow, but ${started.complaint}. ` +
+          `Refusing to report a gate verdict for a page that was never inspected.`
+      );
+    }
+    probe = started.probe;
+    verdict = classifyGate(probe);
+    flowNotes.push(`re-probed after clicking "${applyLabel}" — ${started.note}`);
+  }
+
+  // Last check before a verdict is drawn, and only in the direction that could
+  // produce a false DIRECT APPLY: a gate that has already been *found* is
+  // conclusive (a password field is on screen), so there is nothing to wait for
+  // and nothing to doubt. It is the negative that needs the page to have shown
+  // an application at all.
+  if (!verdict.accountGate && applyAffordanceCount(probe) === 0) {
+    const mounted = await awaitApplyUi(browser, probe);
+    probe = mounted.probe;
+    verdict = classifyGate(probe);
+    flowNotes.push(mounted.note);
+  }
+
+  // Applied once, after the loop: `classifyGate` returns a fresh reasons array
+  // each round, so notes pushed onto an earlier round's verdict would be
+  // dropped by the next one.
+  verdict.reasons.unshift(...flowNotes);
+
+  return { probe, verdict };
+}
+
+/**
+ * Drops a session we have already given up on. Never throws.
+ *
+ * Deliberately does *not* call `close_browser` first, unlike the healthy
+ * teardown in `runBrowserFlow`: the browser behind this session is precisely
+ * what is gone, so the call could only fail, and it would cost another billed
+ * round-trip to learn nothing. `release` still has real work to do either way —
+ * it closes the local transport, which holds an open HTTP connection that would
+ * otherwise keep the CLI process alive, and on the dedicated path it also
+ * aborts the Actor run so a container we have stopped believing in stops
+ * costing money.
+ */
+async function discardSession(session: PlaywrightSession): Promise<void> {
+  try {
+    await session.release();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`[act-005] releasing the dead MCP session failed (ignored): ${reason}`);
+  }
+}
+
 async function runBrowserFlow(
   supabase: SupabaseClient,
   jobApplicationId: string,
@@ -1139,69 +1380,99 @@ async function runBrowserFlow(
   applicationEmail: string,
   closeBrowser: boolean
 ): Promise<Omit<CreateBoardAccountResult, "jobApplicationId">> {
-  const session = await ApifyMcpSession.open();
-  const browser = new PlaywrightBrowser(session);
+  // One dedicated Actor run for this whole attempt: a browser in a container
+  // nothing else can be routed to, from the first navigate to the last probe.
+  // That is what makes a flow of this length viable at all — see the transport
+  // module's header for the replica-routing failure this replaces. The fallback
+  // to the shared standby pool is inside `openPlaywrightSession` and announces
+  // itself loudly; everything below works either way.
+  let session = await openPlaywrightSession();
+  let browser = new PlaywrightBrowser(session);
+  console.log(
+    `[act-005] browser session: ${session.label}` +
+      (session.isolated
+        ? " (isolated for the whole attempt)"
+        : " — NOT isolated: a mid-flow call can land on a replica that never saw this session")
+  );
+  // Two independent questions, and conflating them costs something either way.
+  // `transportOpen` is local: our HTTP connection holds the Node process open,
+  // so it must be closed exactly once — never twice, and never not at all, or
+  // the CLI hangs after printing its result. It also owns the remote run on the
+  // dedicated path, which is the other thing that must not be leaked.
+  // `browserAlive` is remote: whether there is still an Actor-side browser for
+  // `close_browser` to close. A dead session leaves the transport perfectly
+  // open (it is the *inner* session that died) while making `close_browser` a
+  // billed call that can only fail.
+  let transportOpen = true;
+  let browserAlive = true;
 
   try {
-    let probe = await navigateAndProbe(browser, applyUrl);
-    let verdict = classifyGate(probe);
-
-    // "Start the application flow": on boards where the listing page only shows
-    // a description, the form (and any gate behind it) appears after Apply.
-    // Skipped when the form is already on screen — no reason to click anything
-    // on a live employer's site that we do not need to.
-    //
-    // Rounds, rather than a single click, because one is not always enough:
-    // Workday's "Apply" opens a *menu* ("Apply Manually", "Autofill with
-    // Resume") and it is the menu entry that reaches the application. Stopping
-    // after the first click left the run staring at an open menu with no form
-    // and no password field, i.e. a confident — and wrong — DIRECT APPLY on a
-    // board that does gate applications. Verified against the real Salesforce
-    // Workday listing.
-    //
-    // Only labels the probe already classified as apply-ish are ever clicked
-    // (`APPLY_RE` anchors on a leading "apply"), which is what keeps
-    // "Autofill with Resume" and "Use My Last Application" — controls that
-    // would upload a document or submit a prior application — out of reach.
-    const clickedApplyLabels = new Set<string>();
-    const flowNotes: string[] = [];
-
-    for (let round = 0; round < APPLY_CLICK_ROUNDS; round++) {
-      if (verdict.accountGate || applicationFormVisible(probe)) break;
-      // A label already clicked is not a next step — on a menu, clicking it
-      // again just closes what the last click opened.
-      const applyLabel = probe.applyTexts.find((text) => !clickedApplyLabels.has(text));
-      if (applyLabel === undefined) break;
-      clickedApplyLabels.add(applyLabel);
-
-      console.log(`[act-005] no inline form yet — clicking "${applyLabel}" to start the flow`);
-      await browser.click({ text: applyLabel });
-
-      // Same discipline as `navigateAndProbe`: a probe that cannot be tied back
-      // to the page we clicked is not evidence about what the click did, and
-      // "direct apply" drawn from a page belonging to another tenant of the
-      // shared browser is the false success this module exists to avoid.
-      // Failing here is safe to retry — nothing has been filled or submitted
-      // yet — so it throws, and `createBoardAccount` records `error` on the row.
-      const started = await reprobeAfterInteraction(
-        browser,
-        probe,
-        `clicking "${applyLabel}"`
+    let gate: GateOutcome;
+    try {
+      gate = await detectAccountGate(browser, applyUrl);
+    } catch (err) {
+      // The one failure a *fresh session* is the answer to, and the only one
+      // this module recovers from. Everything else — an unrendered page, a
+      // hijacked browser, an uncorroborated click — is already handled where it
+      // happens, and reaching here means those handlers deliberately gave up.
+      //
+      // Kept as defence in depth after the move to a dedicated run, not
+      // because the dedicated path is expected to hit this: a container can
+      // still be migrated, restarted or aborted by the platform underneath us,
+      // and from in here that is indistinguishable from the old standby
+      // routing failure. If the fallback to the shared pool is in effect, this
+      // is once again the primary defence rather than the backstop.
+      //
+      // Exactly one recovery, and it is bounded by structure rather than by a
+      // counter: this is a single `catch` around a single call, with no loop
+      // for a second attempt to come back to. A fresh session is a fresh
+      // browser and a fresh full navigation — real time and real billed calls
+      // — spent on a failure we can neither predict nor prevent. If the
+      // replacement dies too, Apify is having a bad minute, and the honest
+      // answer is the recorded `error` that a later run (or an Inngest retry)
+      // picks up, not a loop that keeps buying browsers.
+      if (!isSessionLostError(err)) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[act-005] the Actor-side browser session died during gate detection: ${reason}`
       );
-      if (!started.corroborated) {
-        throw new Error(
-          `Clicked "${applyLabel}" to start the application flow, but ${started.complaint}. ` +
-            `Refusing to report a gate verdict for a page that was never inspected.`
-        );
-      }
-      probe = started.probe;
-      verdict = classifyGate(probe);
-      flowNotes.push(`re-probed after clicking "${applyLabel}" — ${started.note}`);
+      console.warn(
+        `[act-005] opening a fresh session and starting gate detection over from ${applyUrl} ` +
+          `(one recovery attempt only — if this one dies too, the run fails)`
+      );
+
+      browserAlive = false;
+      await discardSession(session);
+      transportOpen = false;
+      // Only once the replacement is actually in hand do both become this
+      // function's business again: if opening throws, the old session is
+      // already released and there is no new one, so the `finally` must not
+      // touch either.
+      session = await openPlaywrightSession();
+      browser = new PlaywrightBrowser(session);
+      transportOpen = true;
+      browserAlive = true;
+      console.log(`[act-005] replacement browser session: ${session.label}`);
+
+      // Start over from the apply URL rather than from wherever the dead
+      // browser had got to. The new browser shares nothing with the old one —
+      // no history, no open menu, no partially-expanded Apply flow — so
+      // re-entering at a mid-flow URL would be resuming a journey this browser
+      // never took, and on a Workday-style flow that URL is often only
+      // meaningful with the state that produced it. Re-running the whole
+      // detection costs one navigation and at most two apply-ish clicks, and
+      // every guard (`navigateAndProbe`'s corroboration, `assertProbeRendered`,
+      // `reprobeAfterInteraction`) applies to it identically, because it is the
+      // same code path a first attempt takes. A second death here is not caught.
+      gate = await detectAccountGate(browser, applyUrl);
+      gate.verdict.reasons.unshift(
+        `recovered from a dead Actor browser session mid-detection: gate detection was re-run ` +
+          `from scratch on a fresh session/browser, and this verdict comes entirely from that ` +
+          `second run`
+      );
     }
-    // Applied once, after the loop: `classifyGate` returns a fresh reasons array
-    // each round, so notes pushed onto an earlier round's verdict would be
-    // dropped by the next one.
-    verdict.reasons.unshift(...flowNotes);
+
+    const { probe, verdict } = gate;
 
     console.log(
       `[act-005] gate verdict: ${verdict.accountGate ? "ACCOUNT REQUIRED" : "DIRECT APPLY"}`
@@ -1228,6 +1499,9 @@ async function runBrowserFlow(
       };
     }
 
+    // Past this point the flow writes to the board, so a dead session is no
+    // longer recoverable here — see `createAccount`, which classifies the
+    // failure itself rather than letting it be retried.
     return await createAccount(
       supabase,
       browser,
@@ -1236,12 +1510,25 @@ async function runBrowserFlow(
       probe,
       verdict.reasons
     );
+  } catch (err) {
+    // Covers the second death — the one this function has no budget left to
+    // recover from — and any dead-session failure escaping `createAccount`.
+    // Marking it here keeps the teardown from spending a call on a corpse; the
+    // transport is untouched and still has to be closed below.
+    if (isSessionLostError(err)) browserAlive = false;
+    throw err;
   } finally {
-    if (closeBrowser) {
+    // `close_browser` is a billed tool call, and on the dedicated path it buys
+    // nothing: `release` below aborts the run, which takes the container and
+    // its browser with it. Only the shared-pool path needs it, because there
+    // the browser outlives our session on a replica somebody else will get.
+    if (closeBrowser && browserAlive && !session.disposesBrowser) {
       const closeFailure = await browser.closeQuietly();
       if (closeFailure) console.warn(`[act-005] close_browser failed (ignored): ${closeFailure}`);
     }
-    await session.close();
+    // `--keep-browser` means keep the *remote* browser too, so a human can
+    // open the run in the Apify console and look at the page this stopped on.
+    if (transportOpen) await session.release(!closeBrowser);
   }
 }
 
@@ -1349,23 +1636,71 @@ async function createAccount(
 
   const emailSelector = selectorFor(probe.emailFields[0]!, 'input[type="email"]');
   console.log(`[act-005] account gate — filling signup (email → ${emailSelector})`);
-  await browser.typeText(emailSelector, applicationEmail);
 
-  for (const [index, field] of probe.passwordFields.entries()) {
-    const selector = selectorFor(field, `input[type="password"]:nth-of-type(${index + 1})`);
-    await browser.typeText(selector, boardPassword);
+  // From here to the end of this function, a dead Actor-side browser session is
+  // *not* recovered, unlike in gate detection. A fresh session is a fresh
+  // browser: it has never seen this form, so "recovery" could only mean
+  // re-deriving the page and filling it again from scratch. Before the submit
+  // that is merely wasteful; after it, it is a second signup attempt against a
+  // real employer with no way to know whether the first one landed. Both halves
+  // below therefore stop, and differ only in *how* they stop — see each.
+  try {
+    await browser.typeText(emailSelector, applicationEmail);
+
+    for (const [index, field] of probe.passwordFields.entries()) {
+      const selector = selectorFor(field, `input[type="password"]:nth-of-type(${index + 1})`);
+      await browser.typeText(selector, boardPassword);
+    }
+  } catch (err) {
+    if (!isSessionLostError(err)) throw err;
+    // Nothing has been submitted yet, so nothing exists to be confused about:
+    // the half-filled form died with the browser it lived in. `error` (via
+    // `createBoardAccount`'s handler) is the honest status, and it is also the
+    // retryable one — a later run starts from `navigate` and fills a form it
+    // has actually looked at, which is the only correct way to resume this.
+    throw new ApifyMcpError(
+      `The Actor-side browser session died while filling the signup form at ${probe.url}: ` +
+        `${err instanceof Error ? err.message : String(err)}. Nothing was submitted, so no ` +
+        `account was created. Not recovered on a fresh session: a new browser has none of the ` +
+        `form state, and re-filling blind is not something to do on a real employer's site — ` +
+        `re-run this listing instead, which starts over from the apply URL.`
+    );
   }
 
-  console.log(`[act-005] submitting signup via "${submitLabel}"`);
-  await browser.click({ text: submitLabel });
+  let settled: ReprobeOutcome;
+  try {
+    console.log(`[act-005] submitting signup via "${submitLabel}"`);
+    await browser.click({ text: submitLabel });
 
-  // The evidence that the board accepted the submission is only as good as the
-  // page it is read from, so corroborate the page before reading anything off
-  // it. A bare `probePage` here would accept any URL change as proof of success
-  // — including a change caused by another tenant of the shared Actor browser
-  // navigating it away — and write `awaiting_verification` for an account that
-  // was never created.
-  const settled = await reprobeAfterInteraction(browser, probe, `submitting "${submitLabel}"`);
+    // The evidence that the board accepted the submission is only as good as the
+    // page it is read from, so corroborate the page before reading anything off
+    // it. A bare probe here would accept any URL change as proof of success —
+    // including a change caused by another tenant of a shared Actor browser
+    // navigating it away — and write `awaiting_verification` for an account that
+    // was never created.
+    settled = await reprobeAfterInteraction(browser, probe, `submitting "${submitLabel}"`);
+  } catch (err) {
+    if (!isSessionLostError(err)) throw err;
+    // The dangerous half. The session dying at or after the submit click leaves
+    // the one question that matters — did the board create the account? —
+    // permanently unanswerable from in here: the browser that would have shown
+    // us the answer is gone, and a fresh one lands on a logged-out page that
+    // looks identical whether the signup succeeded or never happened.
+    //
+    // So this takes the same exit as an uncorroborated submit below, and for
+    // the same reason: `account_gate_blocked`, not `error`. `error` invites a
+    // retry, and a retry here would re-fill and re-submit a form that may
+    // already have registered this email. The password is on the row for
+    // whoever picks this up.
+    return await blocked(
+      `Signup was submitted via "${submitLabel}", but the Actor-side browser session died before ` +
+        `the result could be read: ${err instanceof Error ? err.message : String(err)}. Whether ` +
+        `the account was created is unknown, and a fresh browser cannot answer that — refusing ` +
+        `to report ${APPLICATION_STATUS.AWAITING_VERIFICATION} on no evidence, and not retrying, ` +
+        `since the submission may already have taken effect. Needs a human.`
+    );
+  }
+
   if (!settled.corroborated) {
     // Note this is *not* `error`: the submit click may well have created the
     // account, so a retry could double-submit. A human has to establish what
