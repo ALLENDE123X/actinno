@@ -169,6 +169,14 @@ function awaitAuthorizationCode(port: number, state: string): Promise<CallbackRe
       settled = true;
       clearTimeout(timer);
       server.close(() => fn());
+      // `close()`'s callback only fires once every open connection is closed,
+      // but the browser has no reason to close its end of a keep-alive
+      // connection just because we sent our one response — observed hanging
+      // here indefinitely in practice: the success page rendered fine, and
+      // the process never got past this point to exchange the code. Force
+      // every open connection closed immediately so the callback above
+      // actually fires instead of waiting on the browser's keep-alive.
+      server.closeAllConnections();
     };
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
