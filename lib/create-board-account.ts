@@ -90,6 +90,22 @@ export type CreateBoardAccountInput = {
 export type PageProbe = {
   url: string;
   title: string;
+  /**
+   * Length of `document.body.innerText`. Raw, unfiltered rendered-content
+   * signal — see `assertProbeRendered`, which is the only reason it is
+   * collected. `innerText` rather than `textContent` because it is
+   * layout-derived: it reports what the page actually *rendered*, which is the
+   * question a corrupted read has to be caught on.
+   */
+  textLength: number;
+  /**
+   * Unfiltered count of clickable elements on the page. The `authTexts` /
+   * `applyTexts` / `submitTexts` arrays below are regex-filtered subsets of the
+   * same set, so all three being empty is ambiguous — it means either "an
+   * ordinary page with no matching labels" or "no page at all". This
+   * distinguishes them.
+   */
+  clickableCount: number;
   passwordFields: FieldDescriptor[];
   emailFields: FieldDescriptor[];
   fileInputs: number;
@@ -221,6 +237,10 @@ var clickable = Array.prototype.slice.call(
 var texts = clickable.map(textOf).filter(function (t) { return t.length > 0 && t.length < 60; });
 function uniq(list) { return Array.prototype.slice.call(new Set(list)); }
 
+// Read once and reuse: innerText forces a layout pass, and two reads of it in
+// one probe could disagree with each other on a page that is still settling.
+var bodyText = ((document.body && document.body.innerText) || '').trim();
+
 var passwords = Array.prototype.slice.call(document.querySelectorAll('input[type=password]'));
 var emails = Array.prototype.slice.call(
   document.querySelectorAll('input[type=email],input[name*="email" i],input[id*="email" i]')
@@ -229,6 +249,8 @@ var emails = Array.prototype.slice.call(
 return {
   url: location.href,
   title: document.title,
+  textLength: bodyText.length,
+  clickableCount: clickable.length,
   passwordFields: passwords.map(describe),
   emailFields: emails.map(describe),
   fileInputs: document.querySelectorAll('input[type=file]').length,
@@ -241,7 +263,7 @@ return {
   submitTexts: uniq(texts.filter(function (t) { return SUBMIT_RE.test(t); })).slice(0, 15),
   iframes: Array.prototype.slice.call(document.querySelectorAll('iframe'))
     .map(function (f) { return f.src || '(srcdoc)'; }).slice(0, 10),
-  bodyMentionsAccount: AUTH_RE.test((document.body && document.body.innerText) || '')
+  bodyMentionsAccount: AUTH_RE.test(bodyText)
 };
 `;
 
@@ -255,13 +277,24 @@ return {
  */
 function assertProbeShape(value: unknown): asserts value is PageProbe {
   const probe = value as Partial<PageProbe> | null | undefined;
+  // Every field `assertProbeRendered` reads is checked here, `title`,
+  // `textLength`, `clickableCount`, `textInputs`, `forms` and `iframes`
+  // included. A missing field arrives as `undefined`, and `undefined === 0` is
+  // false, so an emptiness check reading an absent count would conclude the
+  // page has content — the precise false pass this module exists to prevent.
   const bad =
     !probe ||
     typeof probe !== "object" ||
     typeof probe.url !== "string" ||
+    typeof probe.title !== "string" ||
+    typeof probe.textLength !== "number" ||
+    typeof probe.clickableCount !== "number" ||
     !Array.isArray(probe.passwordFields) ||
     !Array.isArray(probe.emailFields) ||
-    typeof probe.fileInputs !== "number";
+    typeof probe.fileInputs !== "number" ||
+    typeof probe.textInputs !== "number" ||
+    !Array.isArray(probe.forms) ||
+    !Array.isArray(probe.iframes);
 
   if (bad) {
     throw new Error(
@@ -283,10 +316,99 @@ function assertProbeShape(value: unknown): asserts value is PageProbe {
   }
 }
 
+/**
+ * Rendered text a page must carry before its *absence* of a title is treated as
+ * ordinary rather than as a symptom. Sized well below any real listing — the
+ * Salesforce Workday page this check was written for renders several thousand
+ * characters, a bare Greenhouse form several hundred — so it only ever fires on
+ * a page that rendered essentially nothing.
+ */
+const MIN_RENDERED_TEXT_CHARS = 200;
+
+/**
+ * Rejects a probe of a page that is structurally valid but effectively empty.
+ *
+ * The sibling of the `about:blank` check in `assertProbeShape`, for the case
+ * that check cannot see: the browser reporting the *correct* URL for a page that
+ * never rendered. Observed live against a real Salesforce Workday listing —
+ * consecutive `evaluate` calls on one session with no navigation in between
+ * returned `document.body.innerText.length === 0` and `document.title === ""`
+ * (once with 120KB of `outerHTML` behind it, once with a literally empty
+ * `<body>`), while `location.href` stayed correct throughout. Cause is not fully
+ * diagnosed — the standby browser is shared and can be reassigned mid-session
+ * (see `apify-mcp-client.ts`), and a bot-detection interstitial or a page caught
+ * mid-hydration would look the same from in here.
+ *
+ * The cause does not matter, because the consequence is fixed: an unrendered
+ * page has no password field, no form and no auth wording, which `classifyGate`
+ * reads as a confident DIRECT APPLY and this module writes to a real employer's
+ * row as `no_account_required`. Same false success as the blank-page and
+ * wrong-page cases, reached by a different route.
+ *
+ * The three signals are checked separately rather than summed because they fail
+ * independently: text can be suppressed while the DOM is populated, and a DOM
+ * can be populated while nothing lays out. Each on its own means "this is not a
+ * page anybody could apply on".
+ *
+ * What this deliberately does NOT catch, because "rendered" is not the same
+ * question as "rendered the application": a page whose chrome (nav, footer,
+ * cookie banner, job description) rendered normally but whose application
+ * widget itself crashed or never mounted will clear every check here and
+ * still read as a false DIRECT APPLY — same for a bot-detection interstitial
+ * with a real title and a real "I'm not a robot" button. Both pass because
+ * they genuinely have text, a title, and interactive elements; this function
+ * only proves *something* rendered, not that the *application* did. Closing
+ * either needs positive evidence the apply flow itself was seen, which is a
+ * materially bigger change than this file's fail-closed-on-emptiness stance.
+ */
+function assertProbeRendered(probe: PageProbe): void {
+  // Anything at all the visitor could interact with. Deliberately wider than
+  // the gate signals: an iframe or a stray link is thin evidence of a real
+  // page, but zero of *any* of these is conclusive evidence against one.
+  const interactive =
+    probe.clickableCount +
+    probe.forms.length +
+    probe.iframes.length +
+    probe.passwordFields.length +
+    probe.emailFields.length +
+    probe.fileInputs +
+    probe.textInputs;
+
+  const symptoms: string[] = [];
+
+  if (probe.textLength === 0) {
+    symptoms.push("the page rendered no text at all (document.body.innerText is empty)");
+  } else if (probe.textLength < MIN_RENDERED_TEXT_CHARS && probe.title.trim() === "") {
+    // Either alone is survivable — a real page can be terse, and a real SPA can
+    // be slow to set its title. Together they are the signature of a shell.
+    symptoms.push(
+      `the page rendered only ${probe.textLength} characters of text and has an empty <title>`
+    );
+  }
+
+  if (interactive === 0) {
+    symptoms.push(
+      "the page has no link, button, form, input or iframe anywhere in it — nothing to apply with"
+    );
+  }
+
+  if (symptoms.length === 0) return;
+
+  throw new Error(
+    `Page probe reported the correct URL ("${probe.url}") but ${symptoms.join(" and ")}. ` +
+      `That is a browser that did not render the page, not a board without an account gate ` +
+      `— refusing to draw a gate verdict from it.`
+  );
+}
+
 /** Runs the probe and validates it in one step. */
 async function probePage(browser: PlaywrightBrowser): Promise<PageProbe> {
   const raw = await browser.evaluate<unknown>(PAGE_PROBE_SCRIPT);
   assertProbeShape(raw);
+  // Called here rather than at each call site so every probe in this module is
+  // covered by construction — `navigateAndProbe` and `reprobeAfterInteraction`
+  // both route through this function, and a future third caller will too.
+  assertProbeRendered(raw);
   return raw;
 }
 
