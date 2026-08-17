@@ -16,16 +16,17 @@
  * `job_applications` row. It is deliberately one-shot with no retry loop — do
  * not wrap it in one.
  *
- * `--list-tools` skips all of that and just prints the Playwright Actor's MCP
- * tool list (`fetch-actor-details` with `output.mcpTools`), which is the cheap
- * way to check the Actor's surface without navigating anywhere.
+ * `--keep-browser` runs Chrome headed (a visible window on this machine) rather
+ * than headless, so a human can watch the run happen. The browser is still
+ * closed when the run ends. Before ACT-012 this flag meant "leave the shared
+ * remote Apify container alive for console inspection"; there is no remote
+ * container any more, and a window you can watch is the local equivalent.
  */
 
 import { config } from "dotenv";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBoardAccount } from "./create-board-account.js";
-import { ApifyMcpSession, PLAYWRIGHT_MCP_ACTOR } from "./apify-mcp-client.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,7 +39,7 @@ config({ path: resolve(__dirname, "../.env") });
 if (localEnv.error) {
   console.warn(
     "[act-005] No readable ../.env.local — relying on the ambient environment " +
-      "for APIFY_API_TOKEN / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY."
+      "for STAGEHAND_LLM_API_KEY / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY."
   );
 }
 
@@ -50,7 +51,7 @@ const VALUE_FLAGS = [
   "--email",
   "--ats",
 ] as const;
-const BOOL_FLAGS = ["--list-tools", "--keep-browser"] as const;
+const BOOL_FLAGS = ["--keep-browser"] as const;
 
 type ValueFlag = (typeof VALUE_FLAGS)[number];
 type BoolFlag = (typeof BOOL_FLAGS)[number];
@@ -59,7 +60,7 @@ const USAGE =
   "Usage: npm run create-account -- --candidate <uuid> --company <name> " +
   "--job-title <title> --apply-url <https url> --email <email> [--ats <provider>] " +
   "[--keep-browser]\n" +
-  "   or: npm run create-account -- --list-tools";
+  "  --keep-browser   run Chrome headed (visible) instead of headless";
 
 type ParsedArgs = { values: Map<ValueFlag, string>; flags: Set<BoolFlag> };
 
@@ -117,6 +118,7 @@ function redact(text: string): string {
   let out = text;
   for (const key of [
     process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.STAGEHAND_LLM_API_KEY,
     process.env.APIFY_API_TOKEN,
   ]) {
     if (key) out = out.split(key).join("[REDACTED]");
@@ -126,16 +128,6 @@ function redact(text: string): string {
 
 async function main(): Promise<void> {
   const { values, flags } = parseArgs(process.argv.slice(2));
-
-  if (flags.has("--list-tools")) {
-    const session = await ApifyMcpSession.open();
-    try {
-      console.log(await session.fetchActorMcpTools(PLAYWRIGHT_MCP_ACTOR));
-    } finally {
-      await session.close();
-    }
-    return;
-  }
 
   const candidateId = values.get("--candidate");
   const company = values.get("--company");
@@ -156,7 +148,7 @@ async function main(): Promise<void> {
     applyUrl,
     applicationEmail,
     atsProvider: values.get("--ats"),
-    closeBrowser: !flags.has("--keep-browser"),
+    headless: !flags.has("--keep-browser"),
   });
 
   console.log(JSON.stringify(result, null, 2));

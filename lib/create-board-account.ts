@@ -8,9 +8,8 @@
  * on the majority of listings, so the flow here is detection-first:
  *
  *   1. insert a `job_applications` row with status `creating_account`
- *   2. navigate to the apply URL in a real (Playwright) browser and probe the
- *      rendered DOM — a static fetch is not enough, ATS pages build their forms
- *      client-side
+ *   2. navigate to the apply URL in a real browser and read the rendered page —
+ *      a static fetch is not enough, ATS pages build their forms client-side
  *   3. if there is no account gate  → status `no_account_required`
  *      if there is an account gate → create the account with a password from
  *      ACT-004, then status `awaiting_verification`
@@ -18,6 +17,31 @@
  * Scope stops there. Filling the application form is ACT-007 and submitting it
  * is ACT-008; this module must never touch either, even when account creation
  * lands it on the form.
+ *
+ * ── ACT-012: perception layer ────────────────────────────────────────────────
+ * The browser is driven by Stagehand (`@browserbasehq/stagehand`) against a
+ * **local, dedicated** Chrome, and the page is read by `extract()` — an LLM
+ * reasoning over the accessibility tree — rather than by a hand-written
+ * selector probe. Two things changed because of that, and both are load-bearing:
+ *
+ *  · **Unlabelled fields stopped being a problem.** The selector probe this
+ *    replaces reached Salesforce's Workday create-account page and stopped one
+ *    field short: Workday's email box is a plain `<input type="text">` with a
+ *    generated id and no `name`, so nothing in its attributes says "email" and
+ *    the probe correctly refused to guess. A reader that can see the *rendered
+ *    label* has no such blind spot, and does not need a new selector per ATS.
+ *
+ *  · **The hijack-defence layer is gone.** The previous transport was a
+ *    *shared* remote browser that another tenant could be routed into
+ *    mid-flow, which is what the probe corroboration, board-identity keying and
+ *    re-probe stability loops all existed to survive. A browser process this
+ *    module launches, owns, and kills cannot be driven by anyone else, so those
+ *    defences protect against nothing and were deleted rather than ported.
+ *
+ * What did *not* change is the decision layer: `classifyGate`,
+ * `applicationFormSignals`, `APPLICATION_CONTROL_RE`, the `blocked()`
+ * fail-closed exits and the never-retry-after-submit rule are the same rules,
+ * reading the same facts from a different source.
  *
  * Targets the **actinno** Supabase project (`oihpglvvzzmjigxrlmfz`). The guard
  * below is deliberately the same shape as `candidate-intake.ts`'s — the meminno
@@ -29,16 +53,25 @@
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { generateBoardPassword } from "./generate-board-password.js";
+import { z } from "zod";
+import { type Page } from "@browserbasehq/stagehand";
+// Session lifecycle, the observe() cache and `typeInto` used to live in this
+// file. ACT-007 needs all three verbatim, so they moved to `stagehand-session.ts`
+// rather than being copied — see that file's header.
 import {
-  ApifyMcpError,
-  PlaywrightBrowser,
-  isSessionLostError,
-  openPlaywrightSession,
-  type NavigateResult,
-  type NavigateWaitUntil,
-  type PlaywrightSession,
-} from "./apify-mcp-client.js";
+  closeBrowserSession,
+  openBrowserSession,
+  resolveAction,
+  samePage,
+  sleep,
+  typeInto,
+  NAVIGATION_TIMEOUT_MS,
+  type BrowserSession,
+} from "./stagehand-session.js";
+import { generateBoardPassword } from "./generate-board-password.js";
+
+/** Log prefix for this module's flow. */
+const LOG = "[act-005]";
 
 /** Project ref this module is allowed to write to. */
 const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
@@ -53,6 +86,16 @@ const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
  * ACT-006 to sit waiting for a verification email that is never coming. The
  * ACT-007 form-fill step should treat `no_account_required` and
  * `email_verified` as equally ready to proceed.
+ *
+ * The table has outgrown "values *this module* writes" — it is now the whole
+ * pipeline's status vocabulary, and it lives here because
+ * `gmail-verification-listener.ts` already imports it from here. The lower half
+ * is written by `fill-application-form.ts` (ACT-007) and
+ * `submit-application.ts` (ACT-008). ACT-012's brief forbade
+ * changing the values above; nothing forbids a later ticket adding values below
+ * for a capability that did not exist yet, and the alternative — a second,
+ * competing enum in another file — is how a status column stops meaning
+ * anything.
  */
 export const APPLICATION_STATUS = {
   /** Row created; browser work in flight. */
@@ -70,6 +113,76 @@ export const APPLICATION_STATUS = {
   ACCOUNT_GATE_BLOCKED: "account_gate_blocked",
   /** Unrecoverable failure. `error_message` carries the detail. */
   ERROR: "error",
+
+  // ── written by ACT-007 (`fill-application-form.ts`) ────────────────────────
+
+  /**
+   * The emailed verification ACT-006 detected has actually been completed — the
+   * link was opened, or the code was entered — and the board accepted it.
+   *
+   * ACT-006 only *reports* the mail; nobody clicked anything. ACT-007 is what
+   * completes it, and it records the fact here immediately, before it touches
+   * the application form, because verification links and codes are single-use:
+   * a crash between "verified" and "filled" must not send a retry back to a
+   * link the board has already burned.
+   */
+  EMAIL_VERIFIED: "email_verified",
+  /** Form-fill browser work in flight. Mirrors `creating_account`. */
+  FILLING_FORM: "filling_form",
+  /**
+   * ACT-007's terminal success, and ACT-008's pickup signal: the application
+   * form carries the candidate's data and has **not** been submitted.
+   */
+  FORM_FILLED: "form_filled",
+  /**
+   * The form could not be filled safely — an unreachable form, a captcha, a
+   * required cover letter with nowhere to type it, a field whose identity could
+   * not be corroborated. Nothing was submitted. Needs a human.
+   * `error_message` carries the detail. Mirrors `account_gate_blocked`.
+   */
+  FORM_FILL_BLOCKED: "form_fill_blocked",
+
+  // ── written by ACT-008 (`submit-application.ts`) ───────────────────────────
+  //
+  // On the naming: ACT-008's brief says "on failure, set status to `failed`".
+  // These three values implement that requirement without adding a `failed`
+  // synonym for the `error` above, because a single "failed" would collapse the
+  // one distinction that matters most in this pipeline — whether the submit
+  // button was pressed. `error` already means "a failure a retry might genuinely
+  // fix" everywhere else here, and after a real submit a retry is precisely the
+  // forbidden action, so the post-click case needs a value of its own that no
+  // retry path will ever match.
+
+  /**
+   * The application was really submitted to the employer. Terminal, and the one
+   * status in this table that can never be undone — `confirmation_ref` carries
+   * whatever the board showed back (a reference number, the confirmation
+   * wording, or "email confirmation incoming").
+   *
+   * Deliberately absent from ACT-007's `READY_STATUSES`, which is what stops a
+   * second submission attempt against the same row before a browser is opened.
+   */
+  SUBMITTED: "submitted",
+  /**
+   * ACT-008 stopped **before** clicking anything — no control on the filled form
+   * could be identified as *the* application submit, the candidates were
+   * ambiguous, or a review gate declined. Nothing was sent; the form is still
+   * sitting filled in a now-closed browser. `error_message` carries the detail.
+   * Mirrors `form_fill_blocked`, and is safe to re-run from for the same reason.
+   */
+  SUBMISSION_BLOCKED: "submission_blocked",
+  /**
+   * The submit control **was clicked** and the result could not be confirmed —
+   * the session died mid-click, the page could not be read afterwards, or the
+   * board still shows the form. Whether a real application now exists at the
+   * employer is unknown.
+   *
+   * This is not `error` on purpose. Never retry a row in this state
+   * automatically: a human has to check the employer's side (and the inbox from
+   * ACT-006) for an application that may already be there. `error_message`
+   * carries the detail.
+   */
+  SUBMISSION_UNCONFIRMED: "submission_unconfirmed",
 } as const;
 
 export type ApplicationStatus =
@@ -83,53 +196,138 @@ export type CreateBoardAccountInput = {
   applicationEmail: string;
   atsProvider?: string;
   /**
-   * Close the shared Actor browser when finished. Default true — the standby
-   * instance is shared, so leaving a page open is not neighbourly. Set false to
-   * hand a warm page to a follow-on step.
+   * Run Chrome headless. Default true. Set false to watch the run happen —
+   * the local-debugging equivalent of the old `--keep-browser`, which meant
+   * "leave the shared remote container alive so a human can open its console".
+   * There is no remote console any more; there is a window on this machine.
+   *
+   * The browser is closed either way when the call returns: at
+   * `concurrency: { limit: 5 }` a leaked Chrome per run is not survivable.
    */
-  closeBrowser?: boolean;
+  headless?: boolean;
 };
 
-/** What the in-page probe reports back about the rendered apply page. */
-export type PageProbe = {
+// ───────────────────────────────────
+// What the page reader reports back
+// ───────────────────────────────────
+
+/**
+ * The shape `extract()` is asked to fill in. Every field here is something the
+ * decision layer below actually reads — this is deliberately not a general page
+ * description, because each extra field is another thing an LLM can be wrong
+ * about on a page where being wrong writes to a real employer's row.
+ *
+ * The `.describe()` text is not documentation: zod's `toJSONSchema` carries it
+ * into the schema Stagehand hands the model, so it *is* the instruction for
+ * each field. That is where the precision lives — especially for
+ * `emailFieldCount` (the field this whole migration exists for) and
+ * `captchaPresent` (where the obvious naive question has a notorious false
+ * positive).
+ */
+const GateSignalsSchema = z.object({
+  passwordFieldCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Number of password inputs that are actually rendered and visible on the page. " +
+        "A 'password' and a 'confirm password' box count as 2. Do not count hidden, " +
+        "off-screen or collapsed fields, and do not count a password field that only " +
+        "exists inside a closed menu or an unopened dialog."
+    ),
+  emailFieldCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Number of visible text inputs into which the applicant would type an EMAIL " +
+        "ADDRESS, no matter how the input is marked up. Judge this from what a sighted " +
+        "visitor reads — the field's visible label, or the surrounding form — not from " +
+        "its HTML attributes. Workday, for example, renders its sign-up email box as a " +
+        "plain <input type=\"text\"> with a generated id and no name attribute; it is " +
+        "still an email field and must be counted. Do NOT count a field that asks for a " +
+        "username, handle or member id rather than an address. Do NOT count password " +
+        "fields, and do not count the same input twice."
+    ),
+  fileInputCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Number of visible controls that upload a FILE from the applicant's computer — " +
+        "an <input type=file>, a 'Choose file' / 'Upload resume' / 'Attach CV' button, " +
+        "or a drag-and-drop upload zone. Count the drag-and-drop zones: they are file " +
+        "inputs wearing a costume. Do not count a link to a document."
+    ),
+  textInputCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Number of visible free-text inputs and textareas on the page (name, phone, " +
+        "cover letter, and so on). Include the email field(s) counted above; exclude " +
+        "password fields."
+    ),
+  formCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe("Number of distinct forms rendered on the page."),
+  iframeCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Number of embedded frames on the page. Some boards host their whole " +
+        "application inside one, so this is evidence that an application may exist " +
+        "even when no fields are visible at this level."
+    ),
+  clickableTexts: z
+    .array(z.string())
+    .describe(
+      "The visible label of every link, button or clickable control on the page, as " +
+        "the applicant reads it (e.g. \"Apply\", \"Apply Manually\", \"Sign In\", " +
+        "\"Create Account\", \"Submit Application\"). Copy the wording exactly. Include " +
+        "entries of an open menu. Omit controls that are not currently visible."
+    ),
+  captchaPresent: z
+    .boolean()
+    .describe(
+      "True ONLY if the page shows an interactive anti-bot CHALLENGE the visitor would " +
+        "have to solve or interact with — a reCAPTCHA checkbox, an image-selection " +
+        "grid, an hCaptcha or Cloudflare Turnstile widget, a slider puzzle, or a " +
+        "'Checking your browser' interstitial. It is FALSE for a passive notice such as " +
+        "the 'This site is protected by reCAPTCHA and the Google Privacy Policy and " +
+        "Terms of Service apply' footnote, a Cloudflare logo, or any other badge or " +
+        "legal text that asks nothing of the visitor. Those appear on a large share of " +
+        "ordinary forms and are not a challenge."
+    ),
+  captchaEvidence: z
+    .string()
+    .describe(
+      "If captchaPresent is true, what was seen and where, in one short sentence. " +
+        "Empty string otherwise."
+    ),
+});
+
+type ExtractedGateSignals = z.infer<typeof GateSignalsSchema>;
+
+/**
+ * Everything the decision layer reads about one look at one page: what
+ * `extract()` reported, what the browser knows for free (URL, title), and the
+ * regex-filtered control-label buckets the gate rules match on.
+ */
+export type PageSignals = ExtractedGateSignals & {
   url: string;
   title: string;
-  /**
-   * Length of `document.body.innerText`. Raw, unfiltered rendered-content
-   * signal — see `assertProbeRendered`, which is the only reason it is
-   * collected. `innerText` rather than `textContent` because it is
-   * layout-derived: it reports what the page actually *rendered*, which is the
-   * question a corrupted read has to be caught on.
-   */
+  /** Length of `document.body.innerText` — context for the bail-out messages. */
   textLength: number;
-  /**
-   * Unfiltered count of clickable elements on the page. The `authTexts` /
-   * `applyTexts` / `submitTexts` arrays below are regex-filtered subsets of the
-   * same set, so all three being empty is ambiguous — it means either "an
-   * ordinary page with no matching labels" or "no page at all". This
-   * distinguishes them.
-   */
-  clickableCount: number;
-  passwordFields: FieldDescriptor[];
-  emailFields: FieldDescriptor[];
-  fileInputs: number;
-  textInputs: number;
-  forms: Array<{ id: string | null; action: string | null; fields: number }>;
+  /** Control labels matching `AUTH_RE` — recorded, never acted on. */
   authTexts: string[];
+  /** Control labels matching `APPLY_RE` — the only labels this flow will click. */
   applyTexts: string[];
+  /** Control labels matching `SUBMIT_RE` — signup-submit candidates. */
   submitTexts: string[];
-  iframes: string[];
-  bodyMentionsAccount: boolean;
-};
-
-export type FieldDescriptor = {
-  tag: string;
-  type: string | null;
-  name: string | null;
-  id: string | null;
-  autocomplete: string | null;
-  label: string | null;
-  placeholder: string | null;
 };
 
 export type CreateBoardAccountResult = {
@@ -141,7 +339,7 @@ export type CreateBoardAccountResult = {
   reasons: string[];
   finalUrl: string;
   pageTitle: string;
-  probe: PageProbe;
+  signals: PageSignals;
   /** True only when a signup form was actually filled and submitted. */
   accountCreated: boolean;
 };
@@ -191,718 +389,138 @@ function getSupabaseClient(): SupabaseClient {
 }
 
 // ───────────────────────────────────
-// Page probe
+// Reading the page
 // ───────────────────────────────────
 
-/**
- * One `evaluate` call that reports everything the gate decision needs. Done as
- * a single scripted probe rather than a series of get_html/click round-trips
- * because every Actor tool call is a separate billed event *and* a separate
- * page interaction — one probe is both cheaper and gentler on the target site.
- *
- * `String.raw` so the regex backslashes reach the browser intact. Deliberately
- * contains no `${`, which the tag would still interpolate.
- */
-const PAGE_PROBE_SCRIPT = String.raw`
 // \b on both ends is load-bearing, not decoration: without it "sign\s?-?\s?in"
-// matches inside "de-signin-g", which made bodyMentionsAccount fire on a
-// Discord job description that says "designing backend systems". Verified
-// against that real page after the fix.
-const AUTH_RE = /\b(sign\s?-?\s?(in|up)|log\s?-?\s?in|logon|regist(er|ration)|create\s+(an\s+|your\s+)?account|candidate\s+(login|portal|profile)|forgot\s+password)\b/i;
+// matches inside "de-signin-g", which made this fire on a Discord job
+// description that says "designing backend systems". Verified against that real
+// page after the fix.
+const AUTH_RE =
+  /\b(sign\s?-?\s?(in|up)|log\s?-?\s?in|logon|regist(er|ration)|create\s+(an\s+|your\s+)?account|candidate\s+(login|portal|profile)|forgot\s+password)\b/i;
 const APPLY_RE = /^\s*apply\b/i;
-const SUBMIT_RE = /\b(submit|continue|next|create|regist(er|ration)|sign\s?-?\s?up)\b/i;
+const SUBMIT_RE =
+  /\b(submit|continue|next|create|regist(er|ration)|sign\s?-?\s?up)\b/i;
 
-function describe(el) {
-  var label = null;
-  try {
-    if (el.labels && el.labels.length > 0 && el.labels[0].innerText) {
-      label = el.labels[0].innerText.replace(/\s+/g, ' ').trim().slice(0, 80);
-    }
-  } catch (e) { label = null; }
-  return {
-    tag: el.tagName.toLowerCase(),
-    type: el.getAttribute('type'),
-    name: el.getAttribute('name'),
-    id: el.id || null,
-    autocomplete: el.getAttribute('autocomplete'),
-    label: label,
-    placeholder: el.getAttribute('placeholder')
-  };
-}
+const GATE_EXTRACT_INSTRUCTION =
+  "You are looking at a job listing or job application page. Report the structure of " +
+  "the page as an applicant sees it: how many sign-up fields, application fields and " +
+  "upload controls are rendered, what every clickable control is labelled, and whether " +
+  "an anti-bot challenge is blocking the page. Count only what is actually visible " +
+  "right now — ignore hidden, disabled, off-screen and not-yet-opened elements.";
 
-function textOf(el) {
-  var raw = el.innerText || el.value || el.getAttribute('aria-label') || '';
-  return raw.replace(/\s+/g, ' ').trim();
-}
-
-var clickable = Array.prototype.slice.call(
-  document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button]')
-);
-var texts = clickable.map(textOf).filter(function (t) { return t.length > 0 && t.length < 60; });
-// Array.from, NOT Array.prototype.slice.call: a Set has .size and no .length,
-// so slice reads length as undefined and returns [] for every input. That made
-// authTexts/applyTexts/submitTexts silently empty on every page ever probed —
-// invisible on Greenhouse, whose form is inline (the "click Apply first" branch
-// is skipped and the gate verdict comes from the rendered fields), and a false
-// DIRECT APPLY on Workday, whose listing page carries only an "Apply" button.
-// Verified against the real Salesforce listing: the same probe that reported
-// applyTexts: [] had "Apply" and "Sign In" among its 18 clickables.
-function uniq(list) { return Array.from(new Set(list)); }
-
-// Read once and reuse: innerText forces a layout pass, and two reads of it in
-// one probe could disagree with each other on a page that is still settling.
-var bodyText = ((document.body && document.body.innerText) || '').trim();
-
-var passwords = Array.prototype.slice.call(document.querySelectorAll('input[type=password]'));
-var emails = Array.prototype.slice.call(
-  document.querySelectorAll('input[type=email],input[name*="email" i],input[id*="email" i]')
-);
-
-return {
-  url: location.href,
-  title: document.title,
-  textLength: bodyText.length,
-  clickableCount: clickable.length,
-  passwordFields: passwords.map(describe),
-  emailFields: emails.map(describe),
+/**
+ * The handful of facts a DOM query answers exactly and an LLM answers
+ * approximately, read as a floor under the extracted counts.
+ *
+ * This is *not* the old `PAGE_PROBE_SCRIPT` coming back in disguise, and the
+ * distinction matters: that probe's job was to *identify* fields — which input
+ * is the email box — by accumulating selectors and heuristics per ATS, and that
+ * job is exactly what `extract()` does better and is gone for good. This one
+ * counts three element types that `querySelectorAll` counts exactly, and it
+ * exists for one reason: for two of them, an *undercount* is the direction that
+ * causes irreversible harm.
+ *
+ *  · `passwordFields` — undercount reads as DIRECT APPLY on a board that does
+ *    gate applications, i.e. the false success this module is built to avoid.
+ *  · `fileInputs` — undercount reads as "the signup form is isolated from the
+ *    application form", which is the one mistake that can post a half-finished
+ *    job application to a real employer under the candidate's name.
+ *
+ * `iframes` rides along because it is free and improves the apply-affordance
+ * count; nothing safety-critical depends on it. The counts are merged with
+ * `Math.max`, so this can only ever make the module *more* cautious than the
+ * model was — it can add a bail-out, never remove one.
+ */
+const STRUCTURAL_FLOOR_SCRIPT = `(() => ({
+  passwordFields: document.querySelectorAll('input[type=password]').length,
   fileInputs: document.querySelectorAll('input[type=file]').length,
-  textInputs: document.querySelectorAll('input[type=text],input:not([type])').length,
-  forms: Array.prototype.slice.call(document.forms).map(function (f) {
-    return { id: f.id || null, action: f.action || null, fields: f.elements.length };
-  }).slice(0, 10),
-  authTexts: uniq(texts.filter(function (t) { return AUTH_RE.test(t); })).slice(0, 20),
-  applyTexts: uniq(texts.filter(function (t) { return APPLY_RE.test(t); })).slice(0, 10),
-  submitTexts: uniq(texts.filter(function (t) { return SUBMIT_RE.test(t); })).slice(0, 15),
-  iframes: Array.prototype.slice.call(document.querySelectorAll('iframe'))
-    .map(function (f) { return f.src || '(srcdoc)'; }).slice(0, 10),
-  bodyMentionsAccount: AUTH_RE.test(bodyText)
+  iframes: document.querySelectorAll('iframe').length,
+  textLength: ((document.body && document.body.innerText) || '').trim().length
+}))()`;
+
+type StructuralFloor = {
+  passwordFields: number;
+  fileInputs: number;
+  iframes: number;
+  textLength: number;
 };
-`;
 
 /**
- * The probe is a string of JS executed in a remote browser, so a typo or a page
- * that breaks it comes back as `undefined`/`null` rather than a thrown error.
- * Validate the shape before any gate logic reads it — silently treating a
- * broken probe as "no password fields found" would report DIRECT APPLY on a
- * page nobody actually inspected, which is the one wrong answer that looks
- * like success.
+ * Anything at all that could hold or host an application, counted without an
+ * LLM. Used only to decide whether it is worth paying for another `extract()`
+ * while waiting for a late-mounting form — never to draw a verdict.
  */
-function assertProbeShape(value: unknown): asserts value is PageProbe {
-  const probe = value as Partial<PageProbe> | null | undefined;
-  // Every field `assertProbeRendered` reads is checked here, `title`,
-  // `textLength`, `clickableCount`, `textInputs`, `forms` and `iframes`
-  // included. A missing field arrives as `undefined`, and `undefined === 0` is
-  // false, so an emptiness check reading an absent count would conclude the
-  // page has content — the precise false pass this module exists to prevent.
-  const bad =
-    !probe ||
-    typeof probe !== "object" ||
-    typeof probe.url !== "string" ||
-    typeof probe.title !== "string" ||
-    typeof probe.textLength !== "number" ||
-    typeof probe.clickableCount !== "number" ||
-    !Array.isArray(probe.passwordFields) ||
-    !Array.isArray(probe.emailFields) ||
-    typeof probe.fileInputs !== "number" ||
-    typeof probe.textInputs !== "number" ||
-    !Array.isArray(probe.forms) ||
-    !Array.isArray(probe.iframes);
+const DOM_AFFORDANCE_SCRIPT = `document.querySelectorAll('form, input, textarea, select, iframe').length`;
 
-  if (bad) {
-    throw new Error(
-      `Page probe returned an unusable shape (expected PageProbe, got ` +
-        `${JSON.stringify(value)?.slice(0, 300) ?? String(value)}) — refusing to ` +
-        `judge the account gate from it.`
-    );
-  }
-
-  // A blank page is structurally a perfect PageProbe: no password field, no
-  // forms, no auth text — i.e. it reads as a confident "direct apply". It only
-  // ever means the shared Actor browser lost the page, never that the board is
-  // direct-apply, so it must never reach `classifyGate`.
-  if (probe.url === "about:blank" || probe.url === "") {
-    throw new Error(
-      `Page probe ran against "${probe.url}" — the browser is not on the apply ` +
-        `page, so no gate verdict can be drawn from it.`
-    );
-  }
-}
-
-/**
- * Rendered text a page must carry before its *absence* of a title is treated as
- * ordinary rather than as a symptom. Sized well below any real listing — the
- * Salesforce Workday page this check was written for renders several thousand
- * characters, a bare Greenhouse form several hundred — so it only ever fires on
- * a page that rendered essentially nothing.
- */
-const MIN_RENDERED_TEXT_CHARS = 200;
-
-/**
- * Rejects a probe of a page that is structurally valid but effectively empty.
- *
- * The sibling of the `about:blank` check in `assertProbeShape`, for the case
- * that check cannot see: the browser reporting the *correct* URL for a page that
- * never rendered. Observed live against a real Salesforce Workday listing —
- * consecutive `evaluate` calls on one session with no navigation in between
- * returned `document.body.innerText.length === 0` and `document.title === ""`
- * (once with 120KB of `outerHTML` behind it, once with a literally empty
- * `<body>`), while `location.href` stayed correct throughout. Cause is not fully
- * diagnosed — the standby browser is shared and can be reassigned mid-session
- * (see `apify-mcp-client.ts`), and a bot-detection interstitial or a page caught
- * mid-hydration would look the same from in here.
- *
- * The cause does not matter, because the consequence is fixed: an unrendered
- * page has no password field, no form and no auth wording, which `classifyGate`
- * reads as a confident DIRECT APPLY and this module writes to a real employer's
- * row as `no_account_required`. Same false success as the blank-page and
- * wrong-page cases, reached by a different route.
- *
- * The three signals are checked separately rather than summed because they fail
- * independently: text can be suppressed while the DOM is populated, and a DOM
- * can be populated while nothing lays out. Each on its own means "this is not a
- * page anybody could apply on".
- *
- * What this deliberately does NOT catch, because "rendered" is not the same
- * question as "rendered the application": a page whose chrome (nav, footer,
- * cookie banner, job description) rendered normally but whose application
- * widget itself crashed or never mounted will clear every check here and
- * still read as a false DIRECT APPLY — same for a bot-detection interstitial
- * with a real title and a real "I'm not a robot" button. Both pass because
- * they genuinely have text, a title, and interactive elements; this function
- * only proves *something* rendered, not that the *application* did. Closing
- * either needs positive evidence the apply flow itself was seen, which is a
- * materially bigger change than this file's fail-closed-on-emptiness stance.
- */
-function assertProbeRendered(probe: PageProbe): void {
-  const symptoms = renderSymptoms(probe);
-  if (symptoms.length === 0) return;
-
-  throw new Error(
-    `Page probe reported the correct URL ("${probe.url}") but ${symptoms.join(" and ")}. ` +
-      `That is a browser that did not render the page, not a board without an account gate ` +
-      `— refusing to draw a gate verdict from it.`
-  );
-}
-
-/**
- * The evidence `assertProbeRendered` refuses on, as data instead of an
- * exception. Empty means "this page rendered".
- *
- * Split out so the settle step in `navigateAndProbe` can ask *whether* a page
- * has rendered yet — a question with a legitimate "not yet, wait and re-ask"
- * answer during initial load — without either duplicating the emptiness rules
- * or catching an exception as control flow. There is deliberately exactly one
- * definition of "unrendered" in this module, and this is it.
- */
-function renderSymptoms(probe: PageProbe): string[] {
-  // Anything at all the visitor could interact with. Deliberately wider than
-  // the gate signals: an iframe or a stray link is thin evidence of a real
-  // page, but zero of *any* of these is conclusive evidence against one.
-  const interactive =
-    probe.clickableCount +
-    probe.forms.length +
-    probe.iframes.length +
-    probe.passwordFields.length +
-    probe.emailFields.length +
-    probe.fileInputs +
-    probe.textInputs;
-
-  const symptoms: string[] = [];
-
-  if (probe.textLength === 0) {
-    symptoms.push("the page rendered no text at all (document.body.innerText is empty)");
-  } else if (probe.textLength < MIN_RENDERED_TEXT_CHARS && probe.title.trim() === "") {
-    // Either alone is survivable — a real page can be terse, and a real SPA can
-    // be slow to set its title. Together they are the signature of a shell.
-    symptoms.push(
-      `the page rendered only ${probe.textLength} characters of text and has an empty <title>`
-    );
-  }
-
-  if (interactive === 0) {
-    symptoms.push(
-      "the page has no link, button, form, input or iframe anywhere in it — nothing to apply with"
-    );
-  }
-
-  return symptoms;
-}
-
-/**
- * Runs the probe and validates its *shape*. Says nothing about whether the page
- * rendered — only `settleAfterLoad`, which needs to re-ask that question, is
- * allowed to stop here. Everything else goes through `settleAndProbe`, which
- * adds the render assertion once the page has been given time to render.
- */
-async function probeShape(browser: PlaywrightBrowser): Promise<PageProbe> {
-  const raw = await browser.evaluate<unknown>(PAGE_PROBE_SCRIPT);
-  assertProbeShape(raw);
-  return raw;
-}
-
-/** Compares URLs by origin + path — query/hash churn is not a different page. */
-function samePage(a: string, b: string): boolean {
-  try {
-    const left = new URL(a);
-    const right = new URL(b);
-    return (
-      left.origin === right.origin &&
-      left.pathname.replace(/\/+$/, "") === right.pathname.replace(/\/+$/, "")
-    );
-  } catch {
-    return false;
-  }
-}
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Cheap lifecycle for the first navigation attempt, patient one for the retry.
- * See `NavigateWaitUntil` in `apify-mcp-client.ts` for why this is escalated
- * rather than simply set to the patient value: `networkidle` is the better
- * answer for a client-rendered board and the worse answer for any site that
- * polls or beacons forever, and only the page itself can tell us which it is.
- */
-const FAST_WAIT_UNTIL: NavigateWaitUntil = "domcontentloaded";
-const PATIENT_WAIT_UNTIL: NavigateWaitUntil = "networkidle";
-
-/**
- * What "the page mounted something" looks like without knowing the board.
- *
- * `attached` rather than `visible` is deliberate: Playwright resolves a
- * selector list non-strictly, i.e. it waits on the *first* match only, so a
- * hidden first match (a skip link, a collapsed nav button) would leave a
- * visibility wait pending on a page that has in fact rendered. Attachment is
- * the weaker claim, which is the right one here — this wait is a trigger to
- * stop waiting, not evidence of anything. `renderSymptoms` still has to agree
- * afterwards, so a premature hit costs one probe and nothing else.
- */
-const RENDERED_CONTENT_SELECTOR = "main, [role='main'], form, h1, button, a[href]";
-
-/** Budget for that wait. Comfortably inside the Actor's 45s per-call ceiling. */
-const SETTLE_SELECTOR_TIMEOUT_MS = 20_000;
-
-/**
- * Delays between re-probes when the page still looks unrendered. Each entry
- * costs one extra `evaluate` round-trip, so this is short and finite: a page
- * that has not painted anything ~10s after its content selector attached is
- * not going to.
- */
-const SETTLE_PROBE_BACKOFF_MS: readonly number[] = [1_500, 3_000, 5_000];
-
-/**
- * Gives a client-rendered page a bounded chance to actually render before
- * anything judges it.
- *
- * Why this exists: `navigate` with `domcontentloaded` returns when the HTML is
- * parsed, which on a heavy SPA (Workday's careers site is the case that forced
- * this) is well before the framework has fetched its data and mounted the page.
- * The very next `evaluate` then reads a shell — 0 characters of text, empty
- * title, no interactive elements — and `assertProbeRendered` correctly refuses
- * to judge it. Correct, but premature: nobody had actually waited for the page.
- *
- * So: wait for *some* content to attach, then probe, and re-probe a few times
- * while the probe still reports an empty page. Returns the last probe either
- * way — deciding what an unrendered page means is the caller's job, and the
- * answer is still "fail closed".
- */
-async function settleAfterLoad(browser: PlaywrightBrowser): Promise<PageProbe> {
-  const missed = await browser.waitForQuietly(
-    RENDERED_CONTENT_SELECTOR,
-    "attached",
-    SETTLE_SELECTOR_TIMEOUT_MS
-  );
-  // Not fatal, and not even necessarily wrong — the probe below is the actual
-  // measurement. Logged because "no content attached in 20s" is the single most
-  // useful line in the transcript when this page turns out to be unreadable.
-  if (missed) {
-    console.warn(
-      `[act-005] nothing matching "${RENDERED_CONTENT_SELECTOR}" attached within ` +
-        `${SETTLE_SELECTOR_TIMEOUT_MS}ms: ${missed}`
-    );
-  }
-
-  let probe = await probeShape(browser);
-  for (const delayMs of SETTLE_PROBE_BACKOFF_MS) {
-    const symptoms = renderSymptoms(probe);
-    if (symptoms.length === 0) return probe;
-    console.warn(
-      `[act-005] page has not rendered yet (${symptoms.join("; ")}); re-probing in ${delayMs}ms`
-    );
-    await sleep(delayMs);
-    probe = await probeShape(browser);
-  }
-  return probe;
-}
-
-/**
- * `probePage` for a page reached by clicking rather than by navigating.
- *
- * A click on a single-page ATS is a navigation the browser never tells us
- * about: `navigate` has a lifecycle to wait on, a click has nothing, so the
- * probe that follows it runs whenever the click's round-trip happens to return.
- * On Workday that is well inside the route change — verified live against the
- * Salesforce listing, where clicking "Apply Manually" landed the browser on the
- * correct `/apply/applyManually` URL and the immediate probe read a body with
- * zero characters of text and not one link, button, form or input in it.
- *
- * `assertProbeRendered` refused that probe, which was the right call on the
- * evidence and the wrong outcome for the run: the page was not broken, it was
- * two seconds old. Giving a clicked-to page exactly the settle a navigated-to
- * page already gets is the fix, and it is a strictly more patient one — every
- * check still runs, on a probe taken later. Nothing here can turn an unrendered
- * page into an accepted one; `settleAfterLoad` re-probes while the page still
- * looks empty and hands back the last probe either way, and the assertion below
- * is the same terminal one as before.
- */
-async function settleAndProbe(browser: PlaywrightBrowser): Promise<PageProbe> {
-  const probe = await settleAfterLoad(browser);
-  assertProbeRendered(probe);
-  return probe;
-}
-
-/**
- * Navigates and probes, refusing to return a probe of the wrong page — or of a
- * page that never rendered.
- *
- * This guard exists because it fired in practice. `navigate` returned Discord's
- * real URL and title, and the very next `evaluate` — a separate billed
- * round-trip — ran against `about:blank`. The Playwright Actor's browser
- * belongs to a *shared* standby instance (see `apify-mcp-client.ts`), so
- * between two calls the instance can recycle, or another tenant of this public
- * Actor can navigate it away.
- *
- * The failure mode is the dangerous kind: a blank page has no password field,
- * so `classifyGate` reports a confident "DIRECT APPLY" for a board nobody
- * looked at. Structural validation cannot catch it — `about:blank` yields a
- * perfectly well-formed PageProbe. Only comparing the probed URL against the
- * URL we asked for catches it.
- *
- * One re-navigation is allowed, because this is a transient property of a
- * third-party Actor rather than a problem with the target site. Beyond that it
- * fails loudly: reporting no verdict is correct, guessing one is not.
- *
- * The same one retry now also covers the *unrendered* page, via
- * `settleAfterLoad` above, and spends it differently: the second attempt
- * navigates with `networkidle` instead of `domcontentloaded`. Only two things
- * can be wrong at this point — either the browser was lost (a re-navigation
- * fixes it) or the page needed longer than the cheap lifecycle allowed (a
- * patient one fixes it) — and one re-navigation addresses both.
- */
-async function navigateAndProbe(
-  browser: PlaywrightBrowser,
-  applyUrl: string,
-  attemptsLeft = 1,
-  waitUntil: NavigateWaitUntil = FAST_WAIT_UNTIL
-): Promise<PageProbe> {
-  console.log(`[act-005] navigate → ${applyUrl} (wait_until=${waitUntil})`);
-  const nav = await navigateTolerantly(browser, applyUrl, waitUntil);
-  console.log(`[act-005] landed on ${nav.url} — "${nav.title}"`);
-
-  const probe = await settleAfterLoad(browser);
-  const symptoms = renderSymptoms(probe);
-  // Match against what `navigate` actually reported, not the requested URL, so
-  // a legitimate board-side redirect is accepted while a lost page is not.
-  const lostPage = !samePage(probe.url, nav.url);
-  if (!lostPage && symptoms.length === 0) return probe;
-
-  const complaint = lostPage
-    ? `probe ran against "${probe.url}" but navigation had landed on "${nav.url}" — ` +
-      `the shared Actor browser lost the page between calls`
-    : `the page at "${probe.url}" had still not rendered after waiting for it: ` +
-      symptoms.join(" and ");
-
-  if (attemptsLeft > 0) {
-    console.warn(
-      `[act-005] ${complaint}; re-navigating once with wait_until=${PATIENT_WAIT_UNTIL}`
-    );
-    return await navigateAndProbe(browser, applyUrl, attemptsLeft - 1, PATIENT_WAIT_UNTIL);
-  }
-
-  // Terminal, and fail-closed either way. `assertProbeRendered` owns the
-  // wording for the unrendered case and throws on exactly the symptoms above,
-  // so only the lost-page case reaches the throw below it.
-  assertProbeRendered(probe);
-  throw new Error(
-    `${complaint}. Refusing to report a gate verdict for a page that was never inspected.`
-  );
-}
-
-/**
- * `navigate`, downgrading to the cheap lifecycle if the patient one fails.
- *
- * `networkidle` is the escalation that never arrives on a site with a polling
- * XHR or a chatty analytics beacon: Playwright gives up and `navigate` comes
- * back as an Actor error. Falling back keeps that experiment strictly
- * non-destructive — a failed escalation must leave us no worse off than the
- * `domcontentloaded`-only behaviour it replaced, not abort the whole run.
- */
-async function navigateTolerantly(
-  browser: PlaywrightBrowser,
-  applyUrl: string,
-  waitUntil: NavigateWaitUntil
-): Promise<NavigateResult> {
-  if (waitUntil === FAST_WAIT_UNTIL) return await browser.navigate(applyUrl, waitUntil);
-
-  try {
-    return await browser.navigate(applyUrl, waitUntil);
-  } catch (err) {
-    // A dead session is not a lifecycle problem, and the cheap lifecycle is not
-    // a fix for it — retrying here would just spend a second billed call to be
-    // told the same thing. Let it out so the caller can decide about a fresh
-    // session, which is the only thing that helps.
-    if (isSessionLostError(err)) throw err;
-    const reason = err instanceof Error ? err.message : String(err);
-    console.warn(
-      `[act-005] navigate with wait_until=${waitUntil} failed (${reason}); ` +
-        `falling back to wait_until=${FAST_WAIT_UNTIL}`
-    );
-    return await browser.navigate(applyUrl, FAST_WAIT_UNTIL);
-  }
-}
-
-/**
- * Second-level labels used by country registries, so `example.co.uk` is not
- * mistaken for a site called `co.uk`. Not a public suffix list — see `siteOf`.
- */
-const GENERIC_SECOND_LEVEL = new Set(["co", "com", "net", "org", "edu", "gov", "ac", "ne", "or"]);
-
-/**
- * Cheap registrable-domain approximation (no PSL dependency): the last two
- * hostname labels, or three when the second-to-last is a country registry's
- * generic second level. Wrong answers land on "these are different sites",
- * which only ever costs a safe bail-out.
- */
-function siteOf(hostname: string): string {
-  const labels = hostname.toLowerCase().split(".").filter(Boolean);
-  if (labels.length <= 2) return labels.join(".");
-  const take = GENERIC_SECOND_LEVEL.has(labels[labels.length - 2]!) ? 3 : 2;
-  return labels.slice(-take).join(".");
-}
-
-/**
- * ATS platforms that put *every* employer on one shared hostname and identify
- * the employer by the first path segment (`boards.greenhouse.io/acme/jobs/1`,
- * `jobs.lever.co/acme/<id>`). For these, hostname alone is not an identity:
- * `siteOf` reduces Company A's and Company B's boards to the same
- * `greenhouse.io`, so a hostname-only check would happily corroborate one
- * company's page as evidence about another company's submission.
- *
- * That is not hypothetical here — `inngest/job-application-pipeline.ts` runs
- * this flow at `concurrency: { limit: 5 }` against one *shared* standby browser
- * (see `apify-mcp-client.ts`), and five concurrent runs on Greenhouse is the
- * expected case, not the exotic one.
- *
- * Matched against the full hostname. Greenhouse and Lever are the two providers
- * this pipeline names (`inngest/job-application-pipeline.ts`, `mcp-server/index.ts`);
- * the rest are the common shared-domain boards an `atsProvider: "other"` listing
- * can land on. A wrong or stale entry only ever makes the check *stricter* —
- * the cost is a safe bail-out, never a false success — so erring towards
- * inclusion is the right direction.
- */
-const PATH_TENANT_HOSTS: readonly RegExp[] = [
-  /^(job-)?boards(\.eu)?\.greenhouse\.io$/, // boards. / job-boards. / .eu. variants
-  /^jobs(\.eu)?\.lever\.co$/,
-  /^jobs\.ashbyhq\.com$/,
-  /^(careers|jobs)\.smartrecruiters\.com$/,
-  /^apply\.workable\.com$/,
-  /^jobs\.jobvite\.com$/,
-];
-
-/**
- * The same problem one level up: platforms that give each employer its own
- * *subdomain* (`acme.wd5.myworkdayjobs.com`, `acme.icims.com`). `siteOf`'s
- * registrable-domain reduction is precisely what erases the tenant here, so for
- * these the whole hostname is the identity.
- */
-const SUBDOMAIN_TENANT_SITES: ReadonlySet<string> = new Set([
-  "myworkdayjobs.com",
-  "icims.com",
-  "bamboohr.com",
-  "breezy.hr",
-  "recruitee.com",
-  "teamtailor.com",
-  "applytojob.com", // JazzHR
-  "workable.com", // legacy acme.workable.com boards; apply.workable.com is path-tenanted above
-]);
-
-/**
- * The employer slug carried by a shared-hostname board URL, or `null` if the
- * URL carries no identifiable employer at all (in which case it must not be
- * treated as matching anything, including another such URL).
- */
-function tenantSegmentOf(url: URL): string | null {
-  const segments = url.pathname.split("/").filter(Boolean);
-  const first = segments[0]?.toLowerCase();
-  // No path at all (a board root) is nobody's flow; it can only ever match
-  // another board root, which `samePage` would have caught already.
-  if (first === undefined) return "";
-  // Greenhouse's embedded boards carry the employer in `?for=` instead, e.g.
-  // `boards.greenhouse.io/embed/job_app?for=acme&token=1`. Normalising it to
-  // the same slug keeps an embed → hosted-board redirect corroborating. Every
-  // employer's embed shares the identical `/embed/job_app` path, so a
-  // `for`-less embed carries no employer identity to key on at all — return
-  // null rather than a path-based fallback, which would be indistinguishable
-  // across employers and reintroduce the exact collision this function
-  // exists to prevent.
-  if (first === "embed") {
-    const employer = url.searchParams.get("for")?.trim().toLowerCase();
-    return employer || null;
-  }
-  return first;
-}
-
-/**
- * Identity of the *board* a URL belongs to — the unit that has to match for one
- * page to be evidence about another. Registrable domain for an employer's own
- * career site (presumed single-tenant), domain + employer slug on a shared ATS
- * host, full hostname where the ATS tenants by subdomain.
- *
- * Ambiguous pairs (say `boards.greenhouse.io/acme/...` vs `my.greenhouse.io/...`)
- * resolve to different keys and therefore to "not corroborated". That is the
- * intended direction: the alternative is corroborating Company A's submit
- * against a page that may belong to Company B.
- */
-function boardKeyOf(rawUrl: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return null;
-  }
-  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
-  const site = siteOf(hostname);
-  if (PATH_TENANT_HOSTS.some((pattern) => pattern.test(hostname))) {
-    const tenant = tenantSegmentOf(url);
-    if (tenant === null) return null;
-    // Keyed on the site rather than the hostname so Greenhouse's own
-    // boards. → job-boards. move stays the same board.
-    return `${site}/${tenant}`;
-  }
-  if (SUBDOMAIN_TENANT_SITES.has(site)) return hostname;
-  return site;
-}
-
-/**
- * Deliberately coarser than `samePage`: used only to check that a page reached
- * by clicking plausibly belongs to the board we were just on, rather than to
- * another tenant of the shared Actor browser — including the case where that
- * other tenant is a *different employer on the same ATS vendor*, which a
- * hostname-only comparison cannot see.
- */
-function sameBoard(a: string, b: string): boolean {
-  const left = boardKeyOf(a);
-  const right = boardKeyOf(b);
-  return left !== null && left === right;
-}
-
-type ReprobeOutcome =
-  | { corroborated: true; probe: PageProbe; note: string }
-  | { corroborated: false; probe: PageProbe; complaint: string };
-
-/** Probes after an interaction; two agreeing passes minimum, three attempts max. */
-const REPROBE_PASSES = 3;
-
-/**
- * `navigateAndProbe`'s guarantee, for pages reached by *clicking* rather than
- * navigating.
- *
- * `navigateAndProbe` corroborates a probe against the URL `navigate` reported.
- * After a click there is no such reference point, and the naive substitute —
- * "the URL changed, so the click must have worked" — is exactly what the shared
- * Actor browser breaks: another tenant navigating the instance between our
- * click and our probe also changes the URL, and would be read as proof our
- * click did something. That misread is worse after a *submit* click than
- * anywhere else in this module, because it writes `awaiting_verification` for
- * an account that was never created, and ACT-006 then waits forever for a
- * verification email nobody sent.
- *
- * Two independent checks replace the missing reference point:
- *
- *  1. **Stability** — probe until two consecutive probes describe the same page.
- *     A page being churned by another caller (or one still mid-navigation from
- *     our own click) does not hold still across two round-trips.
- *  2. **Relatedness** — the settled page must be the page we interacted with, or
- *     at least elsewhere on the *same employer's board* (`sameBoard`, not merely
- *     the same hostname: on a multi-tenant ATS every employer shares one
- *     domain). A hijacked browser is on somebody else's URL — quite possibly
- *     another Greenhouse employer's, since concurrent runs share this browser;
- *     a real signup step stays within this employer's own board.
- *
- * Retries are re-probes only, never re-clicks: this runs after a submit that may
- * already have taken effect, and clicking twice on a real employer's ATS is not
- * a recoverable mistake. Callers get a verdict rather than an exception, because
- * "we cannot tell what happened" resolves differently before a submit (retry the
- * flow) and after one (stop, a human must look).
- */
-async function reprobeAfterInteraction(
-  browser: PlaywrightBrowser,
-  before: PageProbe,
-  interaction: string
-): Promise<ReprobeOutcome> {
-  // Every probe here is a settled one, not just the first: a board can start a
-  // second route change while we are measuring the first (Workday's apply flow
-  // does exactly that), and a stability pass that reads a shell mid-transition
-  // would fail the run on a page that was about to render perfectly well.
-  let previous = await settleAndProbe(browser);
-  let settled: PageProbe | undefined;
-
-  for (let pass = 1; pass < REPROBE_PASSES; pass++) {
-    const current = await settleAndProbe(browser);
-    if (samePage(current.url, previous.url)) {
-      settled = current;
-      break;
-    }
-    console.warn(
-      `[act-005] page moved between probes ("${previous.url}" → "${current.url}") after ` +
-        `${interaction}; re-probing`
-    );
-    previous = current;
-  }
-
-  if (!settled) {
-    return {
-      corroborated: false,
-      probe: previous,
-      complaint:
-        `the page never held still across ${REPROBE_PASSES} consecutive probes after ` +
-        `${interaction} (last seen "${previous.url}") — the shared Actor browser is being ` +
-        `driven by someone else, so nothing observed on it can be attributed to us`,
-    };
-  }
-
-  // Relatedness is checked *before* `samePage`, not after it, because on a
-  // multi-tenant ATS "same origin + same path" does not imply "same employer":
-  // Greenhouse's embedded boards identify the employer in the query string
-  // (`/embed/job_app?for=acme`), which `samePage` deliberately ignores as churn.
-  // Two concurrent runs on two employers' embed URLs would otherwise short-circuit
-  // straight to `corroborated: true` on the strongest branch of all.
-  if (!sameBoard(settled.url, before.url)) {
-    return {
-      corroborated: false,
-      probe: settled,
-      complaint:
-        `after ${interaction} the browser settled on "${settled.url}", which does not belong to ` +
-        `the same board as the page that was interacted with ("${before.url}") — a page belonging ` +
-        `to another site, or to another employer on the same ATS, cannot be evidence about what ` +
-        `that interaction did`,
-    };
-  }
-
-  if (samePage(settled.url, before.url)) {
-    return {
-      corroborated: true,
-      probe: settled,
-      note: `page stayed on "${settled.url}" after ${interaction}`,
-    };
-  }
+async function readStructuralFloor(page: Page): Promise<StructuralFloor> {
+  const raw = (await page.evaluate(STRUCTURAL_FLOOR_SCRIPT)) as Partial<StructuralFloor> | null;
+  const count = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
   return {
-    corroborated: true,
-    probe: settled,
-    note: `page moved "${before.url}" → "${settled.url}" (same board) after ${interaction}`,
+    passwordFields: count(raw?.passwordFields),
+    fileInputs: count(raw?.fileInputs),
+    iframes: count(raw?.iframes),
+    textLength: count(raw?.textLength),
   };
 }
+
+/** `uniq`, `slice` and the length filter exactly as the old probe applied them. */
+function bucketControlLabels(clickableTexts: string[]): {
+  authTexts: string[];
+  applyTexts: string[];
+  submitTexts: string[];
+} {
+  const texts = clickableTexts
+    .map((text) => String(text ?? "").replace(/\s+/g, " ").trim())
+    .filter((t) => t.length > 0 && t.length < 60);
+  const uniq = (list: string[]): string[] => Array.from(new Set(list));
+
+  return {
+    authTexts: uniq(texts.filter((t) => AUTH_RE.test(t))).slice(0, 20),
+    applyTexts: uniq(texts.filter((t) => APPLY_RE.test(t))).slice(0, 10),
+    submitTexts: uniq(texts.filter((t) => SUBMIT_RE.test(t))).slice(0, 15),
+  };
+}
+
+/**
+ * One look at the page: what the model reports, floored by what the DOM knows
+ * for certain, plus the URL and title the browser can simply be asked for.
+ *
+ * URL and title deliberately do not come from `extract()`. They are facts the
+ * browser already holds; routing them through an LLM would spend tokens to make
+ * them less reliable.
+ */
+async function readPageSignals(session: BrowserSession): Promise<PageSignals> {
+  const { stagehand, page } = session;
+
+  const { data: extracted } = await stagehand.extract(
+    GATE_EXTRACT_INSTRUCTION,
+    GateSignalsSchema,
+    { page }
+  );
+
+  const floor = await readStructuralFloor(page);
+  const [url, title] = await Promise.all([page.url(), page.title()]);
+
+  const buckets = bucketControlLabels(extracted.clickableTexts);
+
+  return {
+    ...extracted,
+    // Fail-closed merge — see STRUCTURAL_FLOOR_SCRIPT.
+    passwordFieldCount: Math.max(extracted.passwordFieldCount, floor.passwordFields),
+    fileInputCount: Math.max(extracted.fileInputCount, floor.fileInputs),
+    iframeCount: Math.max(extracted.iframeCount, floor.iframes),
+    url,
+    title,
+    textLength: floor.textLength,
+    ...buckets,
+  };
+}
+
+// ───────────────────────────────────
+// The gate decision
+// ───────────────────────────────────
 
 /**
  * Decides whether the rendered page gates applying behind an account.
@@ -912,32 +530,32 @@ async function reprobeAfterInteraction(
  * in site chrome, or an optional "autofill from your profile" affordance, and
  * treating those as a gate is exactly the false positive this ticket is about.
  */
-function classifyGate(probe: PageProbe): { accountGate: boolean; reasons: string[] } {
+function classifyGate(signals: PageSignals): { accountGate: boolean; reasons: string[] } {
   const reasons: string[] = [];
 
-  if (probe.passwordFields.length > 0) {
+  if (signals.passwordFieldCount > 0) {
     reasons.push(
-      `${probe.passwordFields.length} rendered password field(s) — conclusive account gate`
+      `${signals.passwordFieldCount} rendered password field(s) — conclusive account gate`
     );
     return { accountGate: true, reasons };
   }
 
   reasons.push("no rendered password field on the apply page");
 
-  if (probe.fileInputs > 0) {
-    reasons.push(`${probe.fileInputs} file input(s) present — resume upload is inline`);
+  if (signals.fileInputCount > 0) {
+    reasons.push(`${signals.fileInputCount} file input(s) present — resume upload is inline`);
   }
-  if (probe.emailFields.length > 0) {
-    reasons.push(`${probe.emailFields.length} email field(s) present in the inline form`);
+  if (signals.emailFieldCount > 0) {
+    reasons.push(`${signals.emailFieldCount} email field(s) present in the inline form`);
   }
-  if (probe.authTexts.length > 0) {
+  if (signals.authTexts.length > 0) {
     // Recorded, not acted on — see the doc comment above.
     reasons.push(
-      `auth-flavoured link text present but not gating: ${JSON.stringify(probe.authTexts)}`
+      `auth-flavoured link text present but not gating: ${JSON.stringify(signals.authTexts)}`
     );
   }
-  if (probe.iframes.length > 0) {
-    reasons.push(`iframes present (probe cannot see inside): ${JSON.stringify(probe.iframes)}`);
+  if (signals.iframeCount > 0) {
+    reasons.push(`${signals.iframeCount} iframe(s) present (their contents were not read)`);
   }
 
   return { accountGate: false, reasons };
@@ -953,47 +571,47 @@ function classifyGate(probe: PageProbe): { accountGate: boolean; reasons: string
 const APPLY_CLICK_ROUNDS = 2;
 
 /** Whether the application form itself is already on screen. */
-function applicationFormVisible(probe: PageProbe): boolean {
-  return probe.fileInputs > 0 || probe.emailFields.length > 0;
+function applicationFormVisible(signals: PageSignals): boolean {
+  return signals.fileInputCount > 0 || signals.emailFieldCount > 0;
 }
 
 /**
  * Anything on the page that could conceivably be applied or signed up *with*.
  *
- * Zero of these at the end of the apply flow is the case `assertProbeRendered`
- * explicitly cannot catch and names as its own blind spot: a page whose chrome
- * rendered fine while the application widget never mounted. It has text, a
- * title and clickable elements, so every emptiness check passes — and then
- * `classifyGate` finds no password field and reports a confident DIRECT APPLY
- * for a board nobody ever saw an application on. Verified live: Salesforce's
- * Workday listing, one second after "Apply Manually", was a 691-character page
- * with 14 clickable elements, a correct title, and not one form, input or
- * upload control anywhere in it.
+ * Zero of these at the end of the apply flow is the false positive that survives
+ * every emptiness check: a page whose chrome rendered fine while the application
+ * widget never mounted. It has text, a title and clickable elements, so the page
+ * plainly "rendered" — and then `classifyGate` finds no password field and
+ * reports a confident DIRECT APPLY for a board nobody ever saw an application
+ * on. Verified live on the old transport: Salesforce's Workday listing, one
+ * second after "Apply Manually", was a 691-character page with 14 clickable
+ * elements, a correct title, and not one form, input or upload control in it.
  *
- * Iframes count. The probe cannot see inside one, so a board that hosts its
- * form in an iframe (Greenhouse's embedded boards) legitimately shows no
- * top-level inputs, and treating that as "no application here" would break the
- * direct-apply majority this module exists to serve.
+ * Iframes count. A board that hosts its form in an iframe (Greenhouse's embedded
+ * boards) legitimately shows no top-level inputs, and treating that as "no
+ * application here" would break the direct-apply majority this module serves.
  */
-function applyAffordanceCount(probe: PageProbe): number {
+function applyAffordanceCount(signals: PageSignals): number {
   return (
-    probe.passwordFields.length +
-    probe.emailFields.length +
-    probe.fileInputs +
-    probe.textInputs +
-    probe.forms.length +
-    probe.iframes.length
+    signals.passwordFieldCount +
+    signals.emailFieldCount +
+    signals.fileInputCount +
+    signals.textInputCount +
+    signals.formCount +
+    signals.iframeCount
   );
 }
 
 /**
- * How long to keep waiting for that widget before calling it absent. Longer and
- * looser than `SETTLE_PROBE_BACKOFF_MS` because it is a different question: the
- * page has already rendered, so this is waiting on a second, later mount (a
- * modal, a lazily-loaded form) rather than on first paint. Each entry costs one
- * probe round-trip, and the whole ladder is ~18s.
+ * How long to keep waiting for that widget before calling it absent.
+ *
+ * Shorter than the ladder this replaces, because it is now doing less work:
+ * Stagehand's `domSettleTimeoutMs` has already absorbed first-paint timing by
+ * the time anything here runs, so this is only waiting on a *second*, later
+ * mount — a modal, a lazily-loaded form. Each rung costs one cheap DOM check;
+ * only a rung that actually finds something pays for an `extract()`.
  */
-const APPLY_UI_BACKOFF_MS: readonly number[] = [2_000, 3_000, 5_000, 8_000];
+const APPLY_UI_BACKOFF_MS: readonly number[] = [2_000, 4_000, 8_000];
 
 /**
  * Waits for a page that rendered without an application on it to grow one, and
@@ -1005,35 +623,30 @@ const APPLY_UI_BACKOFF_MS: readonly number[] = [2_000, 3_000, 5_000, 8_000];
  * employer's row where ACT-007 will act on it.
  */
 async function awaitApplyUi(
-  browser: PlaywrightBrowser,
-  before: PageProbe
-): Promise<{ probe: PageProbe; note: string }> {
-  let probe = before;
+  session: BrowserSession,
+  before: PageSignals
+): Promise<{ signals: PageSignals; note: string }> {
+  let signals = before;
   let waitedMs = 0;
 
   for (const delayMs of APPLY_UI_BACKOFF_MS) {
     console.warn(
-      `[act-005] "${probe.url}" rendered (${probe.textLength} chars, ${probe.clickableCount} ` +
-        `clickable) but carries no form, input, upload control or iframe — waiting ${delayMs}ms ` +
-        `for the application UI to mount`
+      `[act-005] "${signals.url}" rendered (${signals.textLength} chars, ` +
+        `${signals.clickableTexts.length} clickable) but carries no form, input, upload ` +
+        `control or iframe — waiting ${delayMs}ms for the application UI to mount`
     );
     await sleep(delayMs);
     waitedMs += delayMs;
 
-    const current = await settleAndProbe(browser);
-    // Same corroboration rule as everywhere else: a probe that cannot be tied
-    // to the page we were looking at is not evidence about it.
-    if (!sameBoard(current.url, before.url)) {
-      throw new Error(
-        `While waiting for the application UI the browser moved to "${current.url}", which does ` +
-          `not belong to the same board as "${before.url}" — refusing to draw a gate verdict ` +
-          `from it.`
-      );
-    }
-    probe = current;
-    if (applyAffordanceCount(probe) > 0) {
+    // Cheap deterministic check first: re-reading the page with the model on
+    // every rung would spend three LLM calls to be told the DOM is still empty.
+    const domAffordances = Number(await session.page.evaluate(DOM_AFFORDANCE_SCRIPT)) || 0;
+    if (domAffordances === 0) continue;
+
+    signals = await readPageSignals(session);
+    if (applyAffordanceCount(signals) > 0) {
       return {
-        probe,
+        signals,
         note:
           `the apply page had no form or input on first read; one mounted after ${waitedMs}ms ` +
           `of waiting`,
@@ -1042,14 +655,15 @@ async function awaitApplyUi(
   }
 
   throw new Error(
-    `Reached "${probe.url}" at the end of the apply flow and the page is rendered ` +
-      `(${probe.textLength} characters of text, ${probe.clickableCount} clickable elements), but ` +
-      `after ${waitedMs}ms it still has no form, no text input, no email field, no file input, ` +
-      `no password field and no iframe — there is nothing on it to apply with. Reporting ` +
-      `"${APPLICATION_STATUS.NO_ACCOUNT_REQUIRED}" here would be a claim about an application ` +
-      `nobody ever saw. Auth wording on the page: ${JSON.stringify(probe.authTexts)}; ` +
-      `apply-ish controls: ${JSON.stringify(probe.applyTexts)}; ` +
-      `submit-ish controls: ${JSON.stringify(probe.submitTexts)}.`
+    `Reached "${signals.url}" at the end of the apply flow and the page is rendered ` +
+      `(${signals.textLength} characters of text, ${signals.clickableTexts.length} clickable ` +
+      `elements), but after ${waitedMs}ms it still has no form, no text input, no email field, ` +
+      `no file input, no password field and no iframe — there is nothing on it to apply with. ` +
+      `Reporting "${APPLICATION_STATUS.NO_ACCOUNT_REQUIRED}" here would be a claim about an ` +
+      `application nobody ever saw. Auth wording on the page: ` +
+      `${JSON.stringify(signals.authTexts)}; apply-ish controls: ` +
+      `${JSON.stringify(signals.applyTexts)}; submit-ish controls: ` +
+      `${JSON.stringify(signals.submitTexts)}.`
   );
 }
 
@@ -1067,7 +681,7 @@ const APPLICATION_CONTROL_RE = /\b(apply|application|resume|cv)\b/i;
  *
  * A file input is the signal because it is the one element that has no business
  * on a pure signup form: boards ask for an email and a password, never for a
- * document. Only page-level evidence is available — the probe reports counts,
+ * document. Only page-level evidence is available — the reader reports counts,
  * not which form owns each control — so a file input anywhere on the page has
  * to be treated as possibly wired to the same submit we are about to click.
  * That is the conservative direction on purpose: a false positive costs a row a
@@ -1079,29 +693,45 @@ const APPLICATION_CONTROL_RE = /\b(apply|application|resume|cv)\b/i;
  * and "Apply" link text (standard ATS page chrome — the same false positive
  * `classifyGate` documents).
  */
-function applicationFormSignals(probe: PageProbe): string[] {
-  const signals: string[] = [];
+function applicationFormSignals(signals: PageSignals): string[] {
+  const found: string[] = [];
 
-  if (probe.fileInputs > 0) {
-    signals.push(
-      `${probe.fileInputs} file input(s) on the page — resume/cover-letter upload sits alongside ` +
-        `the signup fields`
+  if (signals.fileInputCount > 0) {
+    found.push(
+      `${signals.fileInputCount} file input(s) on the page — resume/cover-letter upload sits ` +
+        `alongside the signup fields`
     );
   }
 
-  return signals;
+  return found;
 }
 
-/** Most specific stable selector we can build for a probed field. */
-function selectorFor(field: FieldDescriptor, fallback: string): string {
-  if (field.id) return `#${CSS_escape(field.id)}`;
-  if (field.name) return `${field.tag}[name="${field.name}"]`;
-  return fallback;
-}
+/**
+ * Tag that makes a captcha bail-out greppable in `error_message`, since it
+ * shares the `account_gate_blocked` status with every other stop-for-a-human
+ * exit.
+ */
+const CAPTCHA_BLOCK_TAG = "captcha_present";
 
-/** Minimal CSS.escape for ids — ATS ids routinely contain `:` and `.`. */
-function CSS_escape(value: string): string {
-  return value.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+/**
+ * The captcha reason string, or `null` when the page is clear.
+ *
+ * Solving is out of scope permanently, not just for this ticket. reCAPTCHA
+ * Enterprise scores solver traffic and acts on it at the *account* level, so a
+ * failed solve does not cost this run — it risks getting the candidate flagged
+ * in a real employer's hiring pipeline, which is not a trade this pipeline is
+ * ever allowed to make on their behalf. Detect, stop, hand it to a human.
+ */
+function captchaBlockReason(signals: PageSignals): string | null {
+  if (!signals.captchaPresent) return null;
+  const evidence = signals.captchaEvidence.trim();
+  return (
+    `${CAPTCHA_BLOCK_TAG}: an interactive anti-bot challenge is on the page at ` +
+    `"${signals.url}"${evidence ? ` (${evidence})` : ""}. Nothing was filled or submitted. ` +
+    `Solving captchas is permanently out of scope — automated attempts are flagged by ` +
+    `reCAPTCHA Enterprise and risk banning the candidate from this employer's real hiring ` +
+    `pipeline. A human has to complete this one.`
+  );
 }
 
 // ───────────────────────────────────
@@ -1134,8 +764,8 @@ function validateInput(input: CreateBoardAccountInput): void {
   } catch {
     throw new Error(`applyUrl must be a valid URL, got: ${input.applyUrl}`);
   }
-  // The browser Actor will happily open file:// or a raw IP; an apply URL that
-  // is not plain https is a configuration bug, not something to navigate to.
+  // A local Chrome will happily open file:// or a raw IP; an apply URL that is
+  // not plain https is a configuration bug, not something to navigate to.
   if (parsed.protocol !== "https:") {
     throw new Error(`applyUrl must be https, got: ${parsed.protocol}//…`);
   }
@@ -1166,7 +796,7 @@ export async function createBoardAccount(
       jobApplicationId,
       applyUrl,
       applicationEmail,
-      input.closeBrowser !== false
+      input.headless !== false
     );
     return { jobApplicationId, ...result };
   } catch (err) {
@@ -1256,32 +886,30 @@ async function claimApplicationRow(
 }
 
 type GateOutcome = {
-  probe: PageProbe;
+  signals: PageSignals;
   verdict: { accountGate: boolean; reasons: string[] };
 };
 
 /**
  * Everything between "open a browser" and "we know whether this board gates
- * applications": navigate, let the page settle, click through to the
- * application if the listing hides it, and classify what is on screen.
+ * applications": navigate, read the page, click through to the application if
+ * the listing hides it, and classify what is on screen.
  *
- * Split out from `runBrowserFlow` because it is the part of the flow that is
- * safe to *start over* on a different browser, which is what that function does
- * when the Actor-side session dies underneath it.
- * That safety is a property of what it does, and holding it in one function is
- * what keeps it checkable: every step here either navigates, reads, or clicks a
- * control whose label the probe already matched as apply-ish, and all of its
- * state is re-derived from a fresh probe rather than carried in. Nothing is
- * typed, nothing is submitted, and nothing survives it except the returned
- * probe. Adding a step that writes to the board would silently make the restart
- * unsafe, so such a step belongs in `createAccount`, not here.
+ * Nothing here writes to the board. Every step either navigates, reads, or
+ * clicks a control whose label already matched `APPLY_RE`; nothing is typed and
+ * nothing is submitted. Adding a step that writes would silently break that
+ * property, so such a step belongs in `createAccount`, not here.
  */
 async function detectAccountGate(
-  browser: PlaywrightBrowser,
+  session: BrowserSession,
   applyUrl: string
 ): Promise<GateOutcome> {
-  let probe = await navigateAndProbe(browser, applyUrl);
-  let verdict = classifyGate(probe);
+  console.log(`[act-005] navigate → ${applyUrl}`);
+  await session.page.goto(applyUrl, { timeout: NAVIGATION_TIMEOUT_MS });
+
+  let signals = await readPageSignals(session);
+  console.log(`[act-005] landed on ${signals.url} — "${signals.title}"`);
+  let verdict = classifyGate(signals);
 
   // "Start the application flow": on boards where the listing page only shows
   // a description, the form (and any gate behind it) appears after Apply.
@@ -1296,40 +924,31 @@ async function detectAccountGate(
   // board that does gate applications. Verified against the real Salesforce
   // Workday listing.
   //
-  // Only labels the probe already classified as apply-ish are ever clicked
-  // (`APPLY_RE` anchors on a leading "apply"), which is what keeps
-  // "Autofill with Resume" and "Use My Last Application" — controls that
-  // would upload a document or submit a prior application — out of reach.
+  // Only labels already classified as apply-ish are ever clicked (`APPLY_RE`
+  // anchors on a leading "apply"), which is what keeps "Autofill with Resume"
+  // and "Use My Last Application" — controls that would upload a document or
+  // submit a prior application — out of reach.
   const clickedApplyLabels = new Set<string>();
   const flowNotes: string[] = [];
 
   for (let round = 0; round < APPLY_CLICK_ROUNDS; round++) {
-    if (verdict.accountGate || applicationFormVisible(probe)) break;
+    if (verdict.accountGate || applicationFormVisible(signals)) break;
     // A label already clicked is not a next step — on a menu, clicking it
     // again just closes what the last click opened.
-    const applyLabel = probe.applyTexts.find((text) => !clickedApplyLabels.has(text));
+    const applyLabel = signals.applyTexts.find((text) => !clickedApplyLabels.has(text));
     if (applyLabel === undefined) break;
     clickedApplyLabels.add(applyLabel);
 
     console.log(`[act-005] no inline form yet — clicking "${applyLabel}" to start the flow`);
-    await browser.click({ text: applyLabel });
+    await session.stagehand.act(
+      `Click the control whose visible label is exactly "${applyLabel}". Do not click any ` +
+        `other control, and do not upload anything.`,
+      { page: session.page }
+    );
 
-    // Same discipline as `navigateAndProbe`: a probe that cannot be tied back
-    // to the page we clicked is not evidence about what the click did, and
-    // "direct apply" drawn from a page belonging to another tenant of the
-    // shared browser is the false success this module exists to avoid.
-    // Failing here is safe to retry — nothing has been filled or submitted
-    // yet — so it throws, and `createBoardAccount` records `error` on the row.
-    const started = await reprobeAfterInteraction(browser, probe, `clicking "${applyLabel}"`);
-    if (!started.corroborated) {
-      throw new Error(
-        `Clicked "${applyLabel}" to start the application flow, but ${started.complaint}. ` +
-          `Refusing to report a gate verdict for a page that was never inspected.`
-      );
-    }
-    probe = started.probe;
-    verdict = classifyGate(probe);
-    flowNotes.push(`re-probed after clicking "${applyLabel}" — ${started.note}`);
+    signals = await readPageSignals(session);
+    verdict = classifyGate(signals);
+    flowNotes.push(`re-read the page after clicking "${applyLabel}" — now at "${signals.url}"`);
   }
 
   // Last check before a verdict is drawn, and only in the direction that could
@@ -1337,10 +956,10 @@ async function detectAccountGate(
   // conclusive (a password field is on screen), so there is nothing to wait for
   // and nothing to doubt. It is the negative that needs the page to have shown
   // an application at all.
-  if (!verdict.accountGate && applyAffordanceCount(probe) === 0) {
-    const mounted = await awaitApplyUi(browser, probe);
-    probe = mounted.probe;
-    verdict = classifyGate(probe);
+  if (!verdict.accountGate && applyAffordanceCount(signals) === 0) {
+    const mounted = await awaitApplyUi(session, signals);
+    signals = mounted.signals;
+    verdict = classifyGate(signals);
     flowNotes.push(mounted.note);
   }
 
@@ -1349,28 +968,7 @@ async function detectAccountGate(
   // dropped by the next one.
   verdict.reasons.unshift(...flowNotes);
 
-  return { probe, verdict };
-}
-
-/**
- * Drops a session we have already given up on. Never throws.
- *
- * Deliberately does *not* call `close_browser` first, unlike the healthy
- * teardown in `runBrowserFlow`: the browser behind this session is precisely
- * what is gone, so the call could only fail, and it would cost another billed
- * round-trip to learn nothing. `release` still has real work to do either way —
- * it closes the local transport, which holds an open HTTP connection that would
- * otherwise keep the CLI process alive, and on the dedicated path it also
- * aborts the Actor run so a container we have stopped believing in stops
- * costing money.
- */
-async function discardSession(session: PlaywrightSession): Promise<void> {
-  try {
-    await session.release();
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`[act-005] releasing the dead MCP session failed (ignored): ${reason}`);
-  }
+  return { signals, verdict };
 }
 
 async function runBrowserFlow(
@@ -1378,106 +976,47 @@ async function runBrowserFlow(
   jobApplicationId: string,
   applyUrl: string,
   applicationEmail: string,
-  closeBrowser: boolean
+  headless: boolean
 ): Promise<Omit<CreateBoardAccountResult, "jobApplicationId">> {
-  // One dedicated Actor run for this whole attempt: a browser in a container
-  // nothing else can be routed to, from the first navigate to the last probe.
-  // That is what makes a flow of this length viable at all — see the transport
-  // module's header for the replica-routing failure this replaces. The fallback
-  // to the shared standby pool is inside `openPlaywrightSession` and announces
-  // itself loudly; everything below works either way.
-  let session = await openPlaywrightSession();
-  let browser = new PlaywrightBrowser(session);
+  // One Chrome process, owned by this call for its whole life. There is no
+  // dead-session recovery below and none is needed: the browser cannot be
+  // reassigned to another tenant, and if it dies the failure is real. Anything
+  // Stagehand throws propagates to `createBoardAccount`, which records `error`
+  // on the row and rethrows.
+  const session = await openBrowserSession({ headless, logTag: LOG });
   console.log(
-    `[act-005] browser session: ${session.label}` +
-      (session.isolated
-        ? " (isolated for the whole attempt)"
-        : " — NOT isolated: a mid-flow call can land on a replica that never saw this session")
+    `${LOG} local browser session opened (headless=${headless}) — dedicated to this run`
   );
-  // Two independent questions, and conflating them costs something either way.
-  // `transportOpen` is local: our HTTP connection holds the Node process open,
-  // so it must be closed exactly once — never twice, and never not at all, or
-  // the CLI hangs after printing its result. It also owns the remote run on the
-  // dedicated path, which is the other thing that must not be leaked.
-  // `browserAlive` is remote: whether there is still an Actor-side browser for
-  // `close_browser` to close. A dead session leaves the transport perfectly
-  // open (it is the *inner* session that died) while making `close_browser` a
-  // billed call that can only fail.
-  let transportOpen = true;
-  let browserAlive = true;
 
   try {
-    let gate: GateOutcome;
-    try {
-      gate = await detectAccountGate(browser, applyUrl);
-    } catch (err) {
-      // The one failure a *fresh session* is the answer to, and the only one
-      // this module recovers from. Everything else — an unrendered page, a
-      // hijacked browser, an uncorroborated click — is already handled where it
-      // happens, and reaching here means those handlers deliberately gave up.
-      //
-      // Kept as defence in depth after the move to a dedicated run, not
-      // because the dedicated path is expected to hit this: a container can
-      // still be migrated, restarted or aborted by the platform underneath us,
-      // and from in here that is indistinguishable from the old standby
-      // routing failure. If the fallback to the shared pool is in effect, this
-      // is once again the primary defence rather than the backstop.
-      //
-      // Exactly one recovery, and it is bounded by structure rather than by a
-      // counter: this is a single `catch` around a single call, with no loop
-      // for a second attempt to come back to. A fresh session is a fresh
-      // browser and a fresh full navigation — real time and real billed calls
-      // — spent on a failure we can neither predict nor prevent. If the
-      // replacement dies too, Apify is having a bad minute, and the honest
-      // answer is the recorded `error` that a later run (or an Inngest retry)
-      // picks up, not a loop that keeps buying browsers.
-      if (!isSessionLostError(err)) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[act-005] the Actor-side browser session died during gate detection: ${reason}`
-      );
-      console.warn(
-        `[act-005] opening a fresh session and starting gate detection over from ${applyUrl} ` +
-          `(one recovery attempt only — if this one dies too, the run fails)`
-      );
-
-      browserAlive = false;
-      await discardSession(session);
-      transportOpen = false;
-      // Only once the replacement is actually in hand do both become this
-      // function's business again: if opening throws, the old session is
-      // already released and there is no new one, so the `finally` must not
-      // touch either.
-      session = await openPlaywrightSession();
-      browser = new PlaywrightBrowser(session);
-      transportOpen = true;
-      browserAlive = true;
-      console.log(`[act-005] replacement browser session: ${session.label}`);
-
-      // Start over from the apply URL rather than from wherever the dead
-      // browser had got to. The new browser shares nothing with the old one —
-      // no history, no open menu, no partially-expanded Apply flow — so
-      // re-entering at a mid-flow URL would be resuming a journey this browser
-      // never took, and on a Workday-style flow that URL is often only
-      // meaningful with the state that produced it. Re-running the whole
-      // detection costs one navigation and at most two apply-ish clicks, and
-      // every guard (`navigateAndProbe`'s corroboration, `assertProbeRendered`,
-      // `reprobeAfterInteraction`) applies to it identically, because it is the
-      // same code path a first attempt takes. A second death here is not caught.
-      gate = await detectAccountGate(browser, applyUrl);
-      gate.verdict.reasons.unshift(
-        `recovered from a dead Actor browser session mid-detection: gate detection was re-run ` +
-          `from scratch on a fresh session/browser, and this verdict comes entirely from that ` +
-          `second run`
-      );
-    }
-
-    const { probe, verdict } = gate;
+    const { signals, verdict } = await detectAccountGate(session, applyUrl);
 
     console.log(
       `[act-005] gate verdict: ${verdict.accountGate ? "ACCOUNT REQUIRED" : "DIRECT APPLY"}`
     );
     for (const reason of verdict.reasons) console.log(`[act-005]   · ${reason}`);
+
+    // Before either branch, because a challenge in front of the page invalidates
+    // both of them: an unsolved captcha means neither "this board wants no
+    // account" nor "here is its signup form" was ever really observed, and the
+    // direct-apply verdict would send ACT-007 straight into the same wall.
+    const captcha = captchaBlockReason(signals);
+    if (captcha !== null) {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
+        error_message: captcha,
+      });
+      console.warn(`[act-005] ${APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED}: ${captcha}`);
+      return {
+        status: APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
+        accountGate: verdict.accountGate,
+        reasons: [...verdict.reasons, captcha],
+        finalUrl: signals.url,
+        pageTitle: signals.title,
+        signals,
+        accountCreated: false,
+      };
+    }
 
     if (!verdict.accountGate) {
       await updateApplication(supabase, jobApplicationId, {
@@ -1492,45 +1031,35 @@ async function runBrowserFlow(
         status: APPLICATION_STATUS.NO_ACCOUNT_REQUIRED,
         accountGate: false,
         reasons: verdict.reasons,
-        finalUrl: probe.url,
-        pageTitle: probe.title,
-        probe,
+        finalUrl: signals.url,
+        pageTitle: signals.title,
+        signals,
         accountCreated: false,
       };
     }
 
-    // Past this point the flow writes to the board, so a dead session is no
-    // longer recoverable here — see `createAccount`, which classifies the
-    // failure itself rather than letting it be retried.
     return await createAccount(
       supabase,
-      browser,
+      session,
       jobApplicationId,
       applicationEmail,
-      probe,
+      signals,
       verdict.reasons
     );
-  } catch (err) {
-    // Covers the second death — the one this function has no budget left to
-    // recover from — and any dead-session failure escaping `createAccount`.
-    // Marking it here keeps the teardown from spending a call on a corpse; the
-    // transport is untouched and still has to be closed below.
-    if (isSessionLostError(err)) browserAlive = false;
-    throw err;
   } finally {
-    // `close_browser` is a billed tool call, and on the dedicated path it buys
-    // nothing: `release` below aborts the run, which takes the container and
-    // its browser with it. Only the shared-pool path needs it, because there
-    // the browser outlives our session on a replica somebody else will get.
-    if (closeBrowser && browserAlive && !session.disposesBrowser) {
-      const closeFailure = await browser.closeQuietly();
-      if (closeFailure) console.warn(`[act-005] close_browser failed (ignored): ${closeFailure}`);
-    }
-    // `--keep-browser` means keep the *remote* browser too, so a human can
-    // open the run in the Apify console and look at the page this stopped on.
-    if (transportOpen) await session.release(!closeBrowser);
+    await closeBrowserSession(session);
   }
 }
+
+/** Instructions cached by `resolveAction`. Stable strings — they are cache keys. */
+const EMAIL_FIELD_INSTRUCTION =
+  "the input on the sign-up form where the applicant types their email address";
+const PASSWORD_FIELD_INSTRUCTION =
+  "the password input on the sign-up form";
+const CONFIRM_PASSWORD_FIELD_INSTRUCTION =
+  "the confirm-password / verify-password input on the sign-up form";
+const SIGNUP_SUBMIT_INSTRUCTION = (label: string): string =>
+  `the button labelled "${label}" that submits the sign-up form`;
 
 /**
  * Fills and submits the board's signup form. Only reached when a password field
@@ -1542,20 +1071,44 @@ async function runBrowserFlow(
  */
 async function createAccount(
   supabase: SupabaseClient,
-  browser: PlaywrightBrowser,
+  session: BrowserSession,
   jobApplicationId: string,
   applicationEmail: string,
-  probe: PageProbe,
+  signals: PageSignals,
   reasons: string[]
 ): Promise<Omit<CreateBoardAccountResult, "jobApplicationId">> {
-  // `observed` defaults to the pre-submit probe, but a bail-out that happens
+  // `observed` defaults to the pre-submit read, but a bail-out that happens
   // *after* a click should report where the browser actually ended up — that is
   // the first thing the human this status escalates to will want to know.
-  const blocked = async (why: string, observed: PageProbe = probe) => {
-    await updateApplication(supabase, jobApplicationId, {
-      status: APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
-      error_message: why,
-    });
+  // `neverThrow` is set by every call site downstream of the submit click (the
+  // point of no return — see below): once the browser has actually attempted a
+  // submit, a failure recording that here must never escape as a rejected
+  // promise, because `createBoardAccount`'s outer catch turns any rejection
+  // into a retryable `error` status, and retrying after a submit risks a
+  // double-signup. Call sites *before* the submit click deliberately keep the
+  // default (rethrow on write failure): nothing has happened yet there, so
+  // surfacing the failure and letting Inngest retry is the safe and desired
+  // behaviour.
+  const blocked = async (
+    why: string,
+    observed: PageSignals = signals,
+    neverThrow = false
+  ) => {
+    try {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
+        error_message: why,
+      });
+    } catch (err) {
+      if (!neverThrow) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[act-005] could not record ${APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED} on ` +
+          `job_applications ${jobApplicationId} (the row may not reflect this): ${reason}. Not ` +
+          `escalating to a retryable \`error\` status regardless — this is past the point of no ` +
+          `return, and a retry here could double-submit. Needs a human to check the row directly.`
+      );
+    }
     console.warn(`[act-005] ${APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED}: ${why}`);
     return {
       status: APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED as ApplicationStatus,
@@ -1563,22 +1116,22 @@ async function createAccount(
       reasons: [...reasons, why],
       finalUrl: observed.url,
       pageTitle: observed.title,
-      probe: observed,
+      signals: observed,
       accountCreated: false,
     };
   };
 
-  if (probe.emailFields.length !== 1) {
+  if (signals.emailFieldCount !== 1) {
     return await blocked(
-      `Account gate detected but ${probe.emailFields.length} email fields were found ` +
+      `Account gate detected but ${signals.emailFieldCount} email fields were found ` +
         `(expected exactly 1) — cannot fill the signup form unambiguously.`
     );
   }
   // Two password fields is the normal "password + confirm" pair. Three or more
   // means we do not understand the form.
-  if (probe.passwordFields.length > 2) {
+  if (signals.passwordFieldCount > 2) {
     return await blocked(
-      `Account gate detected but ${probe.passwordFields.length} password fields were found ` +
+      `Account gate detected but ${signals.passwordFieldCount} password fields were found ` +
         `(expected 1 or 2) — cannot fill the signup form unambiguously.`
     );
   }
@@ -1590,7 +1143,7 @@ async function createAccount(
   // would post a half-finished *job application* to a real employer. There is no
   // way to un-send that, so any sign of the application form sharing the page
   // with the signup form stops the flow for a human.
-  const applicationSignals = applicationFormSignals(probe);
+  const applicationSignals = applicationFormSignals(signals);
   if (applicationSignals.length > 0) {
     return await blocked(
       `Account gate detected, but the signup form is not isolated from the job application ` +
@@ -1600,7 +1153,7 @@ async function createAccount(
     );
   }
 
-  const submitCandidates = probe.submitTexts.filter((t) =>
+  const submitCandidates = signals.submitTexts.filter((t) =>
     /(sign\s?-?\s?up|create|register|continue|submit)/i.test(t)
   );
   // Second half of the scope boundary, at control level rather than page level:
@@ -1613,7 +1166,7 @@ async function createAccount(
   if (!submitLabel) {
     return await blocked(
       `Account gate detected but no control on the page is safely a *signup* submit ` +
-        `(candidates: ${JSON.stringify(probe.submitTexts)}` +
+        `(candidates: ${JSON.stringify(signals.submitTexts)}` +
         (rejected.length > 0
           ? `; rejected because they submit the application itself, not a signup: ` +
             `${JSON.stringify(rejected)}`
@@ -1629,128 +1182,121 @@ async function createAccount(
   // header TODO points at. `board_password` lands in Postgres as plaintext,
   // which is only acceptable while `job_applications` is service_role-only and
   // the sole user is the founder. Encrypt here (pgsodium / Supabase Vault, or
-  // app-level envelope encryption) and decrypt only for the `typeText` call
+  // app-level envelope encryption) and decrypt only for the `typeInto` calls
   // below — that pair of lines is the entire blast radius.
   const boardPassword = generateBoardPassword();
   await updateApplication(supabase, jobApplicationId, { board_password: boardPassword });
 
-  const emailSelector = selectorFor(probe.emailFields[0]!, 'input[type="email"]');
-  console.log(`[act-005] account gate — filling signup (email → ${emailSelector})`);
+  console.log(`[act-005] account gate — filling signup form at ${signals.url}`);
 
-  // From here to the end of this function, a dead Actor-side browser session is
-  // *not* recovered, unlike in gate detection. A fresh session is a fresh
-  // browser: it has never seen this form, so "recovery" could only mean
-  // re-deriving the page and filling it again from scratch. Before the submit
-  // that is merely wasteful; after it, it is a second signup attempt against a
-  // real employer with no way to know whether the first one landed. Both halves
-  // below therefore stop, and differ only in *how* they stop — see each.
-  try {
-    await browser.typeText(emailSelector, applicationEmail);
+  // Filling is safe to fail loudly: nothing has been submitted, so nothing
+  // exists to be confused about, and `error` (via `createBoardAccount`'s
+  // handler) is both the honest status and the retryable one — a later run
+  // starts from `goto` and fills a form it has actually looked at, which is the
+  // only correct way to resume this.
+  await typeInto(session, signals.url, EMAIL_FIELD_INSTRUCTION, applicationEmail);
 
-    for (const [index, field] of probe.passwordFields.entries()) {
-      const selector = selectorFor(field, `input[type="password"]:nth-of-type(${index + 1})`);
-      await browser.typeText(selector, boardPassword);
-    }
-  } catch (err) {
-    if (!isSessionLostError(err)) throw err;
-    // Nothing has been submitted yet, so nothing exists to be confused about:
-    // the half-filled form died with the browser it lived in. `error` (via
-    // `createBoardAccount`'s handler) is the honest status, and it is also the
-    // retryable one — a later run starts from `navigate` and fills a form it
-    // has actually looked at, which is the only correct way to resume this.
-    throw new ApifyMcpError(
-      `The Actor-side browser session died while filling the signup form at ${probe.url}: ` +
-        `${err instanceof Error ? err.message : String(err)}. Nothing was submitted, so no ` +
-        `account was created. Not recovered on a fresh session: a new browser has none of the ` +
-        `form state, and re-filling blind is not something to do on a real employer's site — ` +
-        `re-run this listing instead, which starts over from the apply URL.`
-    );
+  await typeInto(session, signals.url, PASSWORD_FIELD_INSTRUCTION, boardPassword);
+  if (signals.passwordFieldCount === 2) {
+    await typeInto(session, signals.url, CONFIRM_PASSWORD_FIELD_INSTRUCTION, boardPassword);
   }
 
-  let settled: ReprobeOutcome;
+  // Locating the submit control happens *before* the point of no return, and
+  // deliberately outside the `try` below: an `observe()` that cannot find the
+  // button has clicked nothing, so it is an ordinary retryable `error` — and
+  // reporting it as a submission that may have landed would be a lie that costs
+  // a human an investigation.
+  const { action: submitAction } = await resolveAction(
+    session,
+    signals.url,
+    SIGNUP_SUBMIT_INSTRUCTION(submitLabel)
+  );
+
+  // ── the point of no return ─────────────────────────────────────────────────
+  // Everything from the submit click onward is wrapped, and *every* failure in
+  // it exits as `account_gate_blocked` rather than `error`. That is deliberate
+  // and is the single most important rule in this file.
+  //
+  // `error` invites a retry. A retry after this click would re-fill and
+  // re-submit a signup that may already have registered this candidate's email
+  // with a real employer, and nothing observable from here distinguishes "the
+  // click never landed" from "the click landed and then the browser died" — the
+  // page that would have answered is exactly what is gone. So the ambiguous
+  // case is treated as the dangerous one. The password is already on the row for
+  // whoever picks this up.
+  let after: PageSignals;
   try {
     console.log(`[act-005] submitting signup via "${submitLabel}"`);
-    await browser.click({ text: submitLabel });
+    // Deliberately no cache-miss retry here, unlike `typeInto`: a re-click is
+    // not idempotent, and a second submit is precisely what must never happen.
+    await session.stagehand.act({ ...submitAction, method: "click" }, {
+      page: session.page,
+    });
 
-    // The evidence that the board accepted the submission is only as good as the
-    // page it is read from, so corroborate the page before reading anything off
-    // it. A bare probe here would accept any URL change as proof of success —
-    // including a change caused by another tenant of a shared Actor browser
-    // navigating it away — and write `awaiting_verification` for an account that
-    // was never created.
-    settled = await reprobeAfterInteraction(browser, probe, `submitting "${submitLabel}"`);
+    after = await readPageSignals(session);
   } catch (err) {
-    if (!isSessionLostError(err)) throw err;
-    // The dangerous half. The session dying at or after the submit click leaves
-    // the one question that matters — did the board create the account? —
-    // permanently unanswerable from in here: the browser that would have shown
-    // us the answer is gone, and a fresh one lands on a logged-out page that
-    // looks identical whether the signup succeeded or never happened.
-    //
-    // So this takes the same exit as an uncorroborated submit below, and for
-    // the same reason: `account_gate_blocked`, not `error`. `error` invites a
-    // retry, and a retry here would re-fill and re-submit a form that may
-    // already have registered this email. The password is on the row for
-    // whoever picks this up.
+    const reason = err instanceof Error ? err.message : String(err);
     return await blocked(
-      `Signup was submitted via "${submitLabel}", but the Actor-side browser session died before ` +
-        `the result could be read: ${err instanceof Error ? err.message : String(err)}. Whether ` +
-        `the account was created is unknown, and a fresh browser cannot answer that — refusing ` +
-        `to report ${APPLICATION_STATUS.AWAITING_VERIFICATION} on no evidence, and not retrying, ` +
-        `since the submission may already have taken effect. Needs a human.`
+      `Signup was submitted via "${submitLabel}", but the run failed before the result could ` +
+        `be read: ${reason}. Whether the account was created is unknown — refusing to report ` +
+        `${APPLICATION_STATUS.AWAITING_VERIFICATION} on no evidence, and not retrying, since ` +
+        `the submission may already have taken effect. Needs a human.`,
+      signals,
+      true
     );
   }
 
-  if (!settled.corroborated) {
-    // Note this is *not* `error`: the submit click may well have created the
-    // account, so a retry could double-submit. A human has to establish what
-    // actually happened. The password is already stored on the row for them.
-    return await blocked(
-      `Signup was submitted via "${submitLabel}", but ${settled.complaint}. Whether the account ` +
-        `was created is unknown — refusing to report ${APPLICATION_STATUS.AWAITING_VERIFICATION} ` +
-        `on unverifiable evidence, and not retrying, since the submission may already have ` +
-        `taken effect. Needs a human.`,
-      settled.probe
-    );
-  }
-
-  const after = settled.probe;
-  // Both signals now come from a page confirmed to be the one we submitted on
-  // (or its same-board successor). The signup form disappearing is the stronger
-  // of the two; a move to a different page of the board is the weaker one, and
-  // is only trustworthy because of the corroboration above.
-  const formGone = after.passwordFields.length === 0;
-  const movedOn = !samePage(after.url, probe.url);
+  // The signup form disappearing is the stronger of the two signals; a move to a
+  // different page of the board is the weaker one.
+  const formGone = after.passwordFieldCount === 0;
+  const movedOn = !samePage(after.url, signals.url);
   if (!formGone && !movedOn) {
+    const captcha = captchaBlockReason(after);
     return await blocked(
       `Signup form was filled and submitted but the password field is still rendered at ` +
-        `${after.url} — the board likely rejected the submission (validation or captcha).`,
-      after
+        `${after.url} — the board likely rejected the submission (validation or captcha).` +
+        (captcha === null ? "" : ` ${captcha}`),
+      after,
+      true
     );
   }
 
-  await updateApplication(supabase, jobApplicationId, {
-    status: APPLICATION_STATUS.AWAITING_VERIFICATION,
-    error_message: null,
-  });
-  console.log(
-    `[act-005] job_applications ${jobApplicationId} → ${APPLICATION_STATUS.AWAITING_VERIFICATION}` +
-      ` (stopping here: form fill is ACT-007)`
-  );
+  // Same never-throw discipline as `blocked(..., true)` above, and for the same
+  // reason: the submit already happened, so a failure recording that here must
+  // resolve, not reject — rejecting would let `createBoardAccount`'s outer catch
+  // record a retryable `error` for a signup that has already gone through.
+  try {
+    await updateApplication(supabase, jobApplicationId, {
+      status: APPLICATION_STATUS.AWAITING_VERIFICATION,
+      error_message: null,
+    });
+    console.log(
+      `[act-005] job_applications ${jobApplicationId} → ${APPLICATION_STATUS.AWAITING_VERIFICATION}` +
+        ` (stopping here: form fill is ACT-007)`
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[act-005] signup was submitted and the browser confirmed it, but recording ` +
+        `${APPLICATION_STATUS.AWAITING_VERIFICATION} on job_applications ${jobApplicationId} failed: ` +
+        `${reason}. The row may still read a stale status — needs a human to check it directly. Not ` +
+        `retrying regardless, since the submission already happened.`
+    );
+  }
 
   return {
     status: APPLICATION_STATUS.AWAITING_VERIFICATION,
     accountGate: true,
     reasons: [
       ...reasons,
-      `signup submitted via "${submitLabel}"; ${settled.note}`,
+      `signup submitted via "${submitLabel}"`,
       formGone
-        ? `password field is gone from the corroborated page — form accepted`
+        ? `password field is gone from the page — form accepted`
         : `password field still rendered, but the board moved us on to "${after.url}"`,
     ],
     finalUrl: after.url,
     pageTitle: after.title,
-    probe: after,
+    signals: after,
     accountCreated: true,
   };
 }
@@ -1811,5 +1357,3 @@ async function recordFailure(
     );
   }
 }
-
-export { ApifyMcpError };

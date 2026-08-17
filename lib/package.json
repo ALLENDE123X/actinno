@@ -5,12 +5,23 @@
   "type": "module",
   "scripts": {
     "intake": "tsx intake-cli.ts",
-    "create-account": "tsx create-account-cli.ts"
+    "create-account": "tsx create-account-cli.ts",
+    "gmail-auth": "tsx gmail-auth-cli.ts",
+    "verification-listener": "tsx verification-listener-cli.ts",
+    "fill-form": "tsx fill-form-cli.ts",
+    "submit-application": "tsx submit-application-cli.ts",
+    "typecheck": "tsc --noEmit --strict --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 --lib es2023,dom *.ts"
   },
   "dependencies": {
+    "@browserbasehq/stagehand": "^4.0.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@supabase/supabase-js": "^2.45.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "google-auth-library": "^10.5.0",
+    "googleapis": "^175.0.0",
+    "inngest": "^4.18.1",
+    "unpdf": "^1.8.1",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",

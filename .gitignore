@@ -1,5 +1,15 @@
 .env.local
 node_modules/
+# Per-machine observe() selector cache (ACT-012) — an artefact of the pages this
+# machine has visited, not source.
+lib/.stagehand-observe-cache.json
+# Screenshots of filled-but-not-submitted application forms (ACT-007). Run
+# artefacts carrying a real candidate's real data — never commit them.
+lib/.form-fill-screenshots/
+# Screenshots of what the board showed after a real submission (ACT-008). Same
+# reasoning, and the only surviving picture of a run that could not confirm
+# itself — never commit them.
+lib/.submission-screenshots/
 dist/
 *.log
 .DS_Store

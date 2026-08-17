@@ -230,6 +230,88 @@ export async function intakeCandidate(
 }
 
 /**
+ * Everything the pipeline needs to know about a candidate, read back out of the
+ * row this module wrote.
+ *
+ * Added for ACT-009. Its `job-search/requested` and `job-application/requested`
+ * events carry a `candidateId` and nothing else about the person — see that
+ * file's header for why — so something has to turn that id into an
+ * `application_email` for `createBoardAccount`, and this module owns the
+ * `candidates` table's conventions (the project guard, the private-bucket
+ * caveat on `resume_url`). Putting the read anywhere else would mean a sixth
+ * copy of `assertActinnoProject`.
+ *
+ * `resumeUrl` is repeated here with the same caveat it carries on the way in:
+ * it is the bucket-qualified path `resumes/{candidateId}.pdf`, not something
+ * that can be fetched. Nothing in the pipeline uses it — ACT-007's
+ * `loadResume` reads the object itself with the service-role client — and it is
+ * returned only so a caller cannot mistake its absence for the file not
+ * existing.
+ */
+export type CandidateRecord = {
+  candidateId: string;
+  applicationEmail: string;
+  linkedinUrl: string | null;
+  /** Bucket-qualified path, NOT a fetchable URL. */
+  resumeUrl: string;
+  targetTitle: string | null;
+  payMin: number | null;
+  locations: string[] | null;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Reads one `candidates` row by id.
+ *
+ * The UUID check is not defensive clutter. `candidates.id` is the only
+ * per-person key this schema has, `job_applications.candidate_id` is a foreign
+ * key onto it, and ACT-006 emits it as `email/verification-received.data.userId`
+ * for the pipeline's `waitForEvent` to match on. Anything else passed in here —
+ * an auth subject, an email address — would be *accepted by Postgres as a
+ * malformed-uuid error* deep inside a query, or worse, silently match nothing;
+ * failing on the shape first is what turns that into one legible sentence.
+ */
+export async function loadCandidate(candidateId: string): Promise<CandidateRecord> {
+  const id = String(candidateId ?? "").trim();
+  if (!UUID_RE.test(id)) {
+    throw new Error(
+      `candidateId must be a candidates.id UUID, got ${JSON.stringify(candidateId)}. ` +
+        `This is the same identity as job_applications.candidate_id and as the userId ` +
+        `ACT-006 puts on email/verification-received — an email address or an auth ` +
+        `subject here will make the pipeline's verification wait time out with no ` +
+        `visible cause.`
+    );
+  }
+
+  const supabase = getSupabaseClient();
+  const { data, error } = await supabase
+    .from("candidates")
+    .select("id,resume_url,linkedin_url,application_email,target_title,pay_min,locations")
+    .eq("id", id)
+    .limit(1);
+  if (error) throw new Error(`candidates lookup failed: ${error.message}`);
+
+  const row = data?.[0];
+  if (!row) throw new Error(`No candidates row with id ${id} — run ACT-003 intake first.`);
+
+  const applicationEmail = String(row.application_email ?? "").trim();
+  if (applicationEmail === "") {
+    throw new Error(`candidates ${id} has no application_email.`);
+  }
+
+  return {
+    candidateId: id,
+    applicationEmail,
+    linkedinUrl: typeof row.linkedin_url === "string" ? row.linkedin_url : null,
+    resumeUrl: String(row.resume_url ?? ""),
+    targetTitle: typeof row.target_title === "string" ? row.target_title : null,
+    payMin: typeof row.pay_min === "number" ? row.pay_min : null,
+    locations: Array.isArray(row.locations) ? row.locations.map(String) : null,
+  };
+}
+
+/**
  * Best-effort removal of an uploaded object after a failed insert. Never
  * throws: a cleanup failure must not mask the original error, so it is
  * annotated onto that error's message instead.
