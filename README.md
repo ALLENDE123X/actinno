@@ -84,6 +84,34 @@ npm install
 npm start          # stdio — normally spawned by Claude Desktop, not by hand
 ```
 
+### Registering it with Claude Desktop, and the ~/Desktop sandbox
+
+Claude Desktop runs each MCP server inside a macOS Seatbelt sandbox that is
+**separate from the app's own Full Disk Access grant**, and that sandbox denies
+reads anywhere under `~/Desktop`. Pointing the config straight at
+`mcp-server/node_modules/.bin/tsx` in this repo therefore dies immediately with
+`EPERM: operation not permitted` on tsx's own entry file, before any of this
+code runs. Granting Claude full disk access does not help; the subprocess is
+sandboxed regardless.
+
+The fix, so the repo can stay where it is:
+
+```
+cd mcp-server && npm run bundle    # -> ~/.actinno-mcp/server.mjs
+```
+
+esbuild inlines every import into one file outside `~/Desktop`, so the
+subprocess never has to read this directory at all. Point the `actinno` entry in
+`~/Library/Application Support/Claude/claude_desktop_config.json` at that file
+with an absolute `node` path, and pass `APIFY_API_TOKEN` and `INNGEST_DEV=1` in
+the entry's `env` — `load-env.ts` cannot reach `.env.local` from the bundle
+either (it warns and carries on using the ambient environment, which is exactly
+what those `env` values are for).
+
+**The bundle is a snapshot.** Re-run `npm run bundle` after any change to
+`mcp-server/` or the `lib/` modules it imports, or Claude Desktop keeps running
+the old code.
+
 Two tools, `search_actors` and `call_actor`, and two actors behind them.
 `actinno/bulk-search-job-listings` is one read-only API call and answers inline.
 `actinno/apply-to-job` does **not** run the application here: it sends

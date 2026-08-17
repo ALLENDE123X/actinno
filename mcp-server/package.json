@@ -6,6 +6,7 @@
   "main": "index.ts",
   "scripts": {
     "start": "tsx index.ts",
+    "bundle": "esbuild index.ts --bundle --platform=node --format=esm --target=node20 --outfile=$HOME/.actinno-mcp/server.mjs --banner:js=\"import{createRequire as __cr}from'node:module';const require=__cr(import.meta.url);\"",
     "typecheck": "tsc --noEmit --strict --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 --lib es2023,dom *.ts"
   },
   "dependencies": {
