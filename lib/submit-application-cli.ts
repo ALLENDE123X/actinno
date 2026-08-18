@@ -33,6 +33,13 @@
  * `npm run fill-form` step to do first: this runs the fill itself, in the same
  * browser session, because a filled form cannot outlive its browser.
  *
+ * ACT-017 adds one more: the Gmail credentials ACT-006 uses (`GOOGLE_OAUTH_*` in
+ * `.env.local`, minted by `npm run gmail-auth`) must be live. Greenhouse answers
+ * the first Submit click by emailing an 8-character security code and refusing
+ * to submit until it is typed in, and this reads that code out of the same
+ * mailbox ACT-006 watches, scoped the same way. `--verification-code` skips the
+ * mailbox when you already hold the code.
+ *
  * ── This is the acceptance test ─────────────────────────────────────────────
  * ACT-008's criterion is "one real end-to-end submission, confirmation email
  * lands in the inbox used for ACT-006, `job_applications` row correctly reflects
@@ -119,7 +126,11 @@ const USAGE = [
   "  --job-description-file    file holding the listing's description text; used as",
   "                            (untrusted) background for the cover letter",
   "  --verification-link       verificationLink from ACT-006's event",
-  "  --verification-code       verificationCode from ACT-006's event",
+  "  --verification-code       verificationCode from ACT-006's event. When the row is NOT at",
+  "                            awaiting_verification this doubles as the emailed security code",
+  "                            some boards demand after the first Submit click (ACT-017): pass",
+  "                            it to skip the mailbox poll when mail is slow. Left out, the",
+  "                            code is read from the ACT-006 inbox automatically.",
   "  --screenshot-dir          where to write the post-submit screenshot",
   "  --fill-screenshot-dir     where ACT-007 writes its filled-form screenshot",
   "  --answer <key>=<answer>   an answer to something a previous run reported under",
@@ -261,6 +272,15 @@ function printReport(result: SubmitApplicationResult): void {
     console.log(`  form still on screen:   ${c.applicationFormStillPresent}`);
     if (c.confirmationText !== "") console.log(`  text: ${c.confirmationText}`);
     if (c.validationErrorsShown) console.log(`  errors: ${c.validationErrorText}`);
+  }
+  if (result.securityCode !== null) {
+    const s = result.securityCode;
+    console.log("\nemailed security code (ACT-017):");
+    console.log(`  board demanded one:  ${s.demanded}`);
+    console.log(`  code came from:      ${s.source}`);
+    console.log(`  entered on the page: ${s.entered}`);
+    console.log(`  resubmitted:         ${s.resubmitted}`);
+    console.log(`  ${s.detail}`);
   }
   if (result.confirmationRef !== null) {
     console.log(`\nconfirmation_ref written to the row:\n  ${result.confirmationRef}`);

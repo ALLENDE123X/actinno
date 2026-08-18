@@ -1082,3 +1082,193 @@ export async function runVerificationListener(
     if (stopped) return;
   }
 }
+
+// ───────────────────────────────────
+// ACT-017 — one scoped read of the mailbox, for a code a live browser is waiting on
+// ───────────────────────────────────
+
+/**
+ * `pollOnce` above is the standing listener: it discovers its own work from
+ * Supabase, attributes each message to one of several competing signups, and
+ * announces the result on an Inngest event. ACT-017 needs none of that. It has
+ * exactly one row, one board and one instant it is asking about — the moment
+ * `submit-application.ts` clicked Submit and Greenhouse answered with "enter the
+ * 8-character code we just emailed you" — and it needs the answer returned, not
+ * broadcast.
+ *
+ * What it must *not* have is a second Gmail client, a second sender allowlist or
+ * a second code parser, so this reuses all three: `buildGmailQuery` (which is
+ * where the sender-domain and time bounds actually live),
+ * `senderDomainAllowed`, and `extractVerification`. The boundary is byte-for-
+ * byte the one this module's header describes, with one deliberate difference,
+ * called out because it is a loosening:
+ *
+ *   **`VERIFICATION_INTENT_RE` is not applied.** Greenhouse's security-code mail
+ *   — subject "Security code for your application to Discord", body "Copy and
+ *   paste this code into the security code field on your application: …" —
+ *   contains none of "verify", "confirm", "activate" or "validate", so the
+ *   intent check would reject the exact message this exists to read. The
+ *   intent requirement is not dropped, it moves: `CODE_ANCHOR_RE` inside
+ *   `extractVerification` only yields a code when the mail announces one in so
+ *   many words, and a message that announces no code returns nothing here. The
+ *   sender allowlist and the time window — the two rules that make this not a
+ *   phishing surface — are untouched.
+ *
+ * Read-only, like everything else in this file. Nothing is labelled, moved or
+ * deleted, and the code is returned rather than logged.
+ */
+export type MailboxCode = {
+  code: string;
+  /** The domain the mail actually came from, after allowlist checking. */
+  senderDomain: string;
+  subject: string;
+  receivedAtMs: number;
+  gmailMessageId: string;
+};
+
+export type MailboxCodeResult =
+  | { found: true; hit: MailboxCode }
+  | { found: false; reason: string };
+
+/**
+ * One pass over the mailbox for a code from `domains` that arrived at or after
+ * `sinceMs`.
+ *
+ * Gmail returns matches newest-first, so the first message that survives every
+ * check is the newest one that does. Throws `GmailAuthError` on a credential
+ * failure (via `rethrowAsAuthError`); every other failure is left to the caller.
+ */
+export async function findMailboxCode(
+  gmail: gmail_v1.Gmail,
+  domains: readonly string[],
+  sinceMs: number,
+  nowMs: number
+): Promise<MailboxCodeResult> {
+  const query = buildGmailQuery(domains, sinceMs, nowMs);
+  if (query === null) {
+    return {
+      found: false,
+      reason: "no allowlisted sender domain could be derived for this board, so there is nothing safe to search for",
+    };
+  }
+
+  let listed: gmail_v1.Schema$ListMessagesResponse;
+  try {
+    const response = await gmail.users.messages.list({
+      userId: "me",
+      q: query,
+      maxResults: MAX_MESSAGES_PER_QUERY,
+    });
+    listed = response.data;
+  } catch (err) {
+    rethrowAsAuthError(err);
+  }
+
+  const stubs = listed.messages ?? [];
+  const rejected: string[] = [];
+
+  for (const stub of stubs) {
+    if (!stub.id) continue;
+
+    let message: gmail_v1.Schema$Message;
+    try {
+      const response = await gmail.users.messages.get({
+        userId: "me",
+        id: stub.id,
+        format: "full",
+      });
+      message = response.data;
+    } catch (err) {
+      rethrowAsAuthError(err);
+    }
+
+    const from = headerValue(message, "From");
+    const senderDomain = senderDomainAllowed(from, domains);
+    if (senderDomain === null) {
+      rejected.push(`${stub.id}: sender is not on ${domains.join(", ")}`);
+      continue;
+    }
+
+    // Re-checked exactly, for the reason `matchMessage` gives: Gmail's own
+    // after:/before: granularity is not contractually to-the-second, and this
+    // half of the boundary is worth enforcing against a number we control.
+    const receivedAtMs = Number(message.internalDate ?? NaN);
+    if (!Number.isFinite(receivedAtMs)) {
+      rejected.push(`${stub.id}: no usable internalDate`);
+      continue;
+    }
+    if (receivedAtMs < sinceMs - CLOCK_SKEW_MS) {
+      rejected.push(`${stub.id}: arrived before the click`);
+      continue;
+    }
+    if (receivedAtMs > sinceMs + VERIFICATION_WINDOW_MS) {
+      rejected.push(`${stub.id}: arrived after the window closed`);
+      continue;
+    }
+
+    const subject = headerValue(message, "Subject");
+    const bodies = collectBodies(message.payload ?? undefined);
+    const { code } = extractVerification(subject, bodies.text, bodies.html, domains);
+    if (code === null) {
+      rejected.push(`${stub.id}: announces no code this could extract`);
+      continue;
+    }
+
+    return {
+      found: true,
+      hit: { code, senderDomain, subject, receivedAtMs, gmailMessageId: stub.id },
+    };
+  }
+
+  return {
+    found: false,
+    reason:
+      stubs.length === 0
+        ? `no mail from ${domains.join(", ")} has arrived since the click`
+        : `${stubs.length} message(s) were in scope and none carried a usable code ` +
+          `(${rejected.slice(0, 4).join("; ")})`,
+  };
+}
+
+export type MailboxCodeWait = {
+  gmail: gmail_v1.Gmail;
+  /** From `allowedSenderDomains(applyUrl)` — the caller's board, nothing wider. */
+  domains: readonly string[];
+  /** ms epoch. Nothing older than this (bar `CLOCK_SKEW_MS`) is looked at. */
+  sinceMs: number;
+  timeoutMs: number;
+  intervalMs: number;
+  now?: () => number;
+  log?: (line: string) => void;
+};
+
+/**
+ * `findMailboxCode` on a bounded loop.
+ *
+ * Bounded is the operative word: the caller is holding a live browser sitting on
+ * a half-submitted application while this runs, so there is no version of this
+ * that waits "until it turns up". It polls until `timeoutMs` and then reports
+ * that it did not find one, which the caller treats as a full stop.
+ */
+export async function waitForMailboxCode(options: MailboxCodeWait): Promise<MailboxCodeResult> {
+  const now = options.now ?? ((): number => Date.now());
+  const deadline = now() + Math.max(0, options.timeoutMs);
+  let last: MailboxCodeResult = { found: false, reason: "the mailbox was never read" };
+
+  for (;;) {
+    last = await findMailboxCode(options.gmail, options.domains, options.sinceMs, now());
+    if (last.found) return last;
+
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    options.log?.(
+      `${last.reason} — waiting (${Math.round(remaining / 1000)}s left before giving up)`
+    );
+    await sleep(Math.min(options.intervalMs, remaining));
+  }
+
+  return {
+    found: false,
+    reason: `${last.reason}; gave up after ${Math.round(options.timeoutMs / 1000)}s`,
+  };
+}

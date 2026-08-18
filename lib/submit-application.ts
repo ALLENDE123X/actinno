@@ -8,13 +8,20 @@
  * real company. Every unusual-looking decision below exists because of that
  * sentence, and the two rules the whole file is built around are:
  *
- *   1. **The submit control is clicked at most once, ever.** There is exactly one
- *      click site in this file (`page.locator(...).click()` inside the point-of-
- *      no-return block). It is not in a loop, it has no retry, no catch that
- *      leads back to it, and no caller can ask for a second attempt: a row whose
- *      status is already `submitted` or `submission_unconfirmed` is refused in
- *      `preflight()` before a browser is opened, and refused again by ACT-007's
- *      `READY_STATUSES` if it somehow got past that.
+ *   1. **One logical submission, ever.** Until ACT-017 that was enforced as "one
+ *      click", which was a proxy for it; Greenhouse broke the proxy by answering
+ *      the click with "enter the 8-character code we just emailed you, then
+ *      resubmit", so the rule is now enforced as written. There are exactly two
+ *      `locator.click()` sites in this file and the second is reachable only
+ *      from the branch where the first click **demonstrably submitted nothing**
+ *      — form still on screen, same URL, no confirmation, a one-time code
+ *      demanded. Neither is in a loop, neither has a retry, no catch leads back
+ *      to either, there is no third, and no caller can ask for another attempt:
+ *      a row whose status is already `submitted` or `submission_unconfirmed` is
+ *      refused in `preflight()` before a browser is opened, and refused again by
+ *      ACT-007's `READY_STATUSES` if it somehow got past that. The whole of that
+ *      second leg is documented at `SecurityCodeReport`, above the code that
+ *      does it.
  *
  *   2. **Nothing that happens at or after the click may produce a status that
  *      reads as safely retryable.** From the instant before the click, every
@@ -79,6 +86,15 @@ import {
   tryResolveAction,
   type BrowserSession,
 } from "./stagehand-session.js";
+// ACT-017. The deterministic half of ACT-015 — read the DOM, put one value into
+// one control — reused verbatim for the security-code field. No model, and no
+// natural-language instruction, on the path that types the code.
+import { applyFieldValue, enumerateFormFields, type EnumeratedField } from "./form-fields.js";
+// ACT-017. ACT-006's mailbox machinery, reused rather than reimplemented: the
+// sender allowlist derived from this row's own apply URL, and the scoped,
+// time-bounded search that ends in its code extractor.
+import { allowedSenderDomains, waitForMailboxCode } from "./gmail-verification-listener.js";
+import { createGmailClient } from "./gmail-client.js";
 
 const LOG = "[act-008]";
 
@@ -162,6 +178,13 @@ const ConfirmationSignalsSchema = z.object({
     .describe(
       "If validationErrorsShown is true, the error wording seen, in one short sentence. Empty " +
         "string otherwise."
+    ),
+  securityCodeRequested: z
+    .boolean()
+    .describe(
+      "True if the page is now asking the applicant to type in a one-time security, " +
+        "verification or confirmation code that was just emailed to them, in order to finish " +
+        "submitting this application. False if the page asks for no such code."
     ),
 });
 
@@ -277,7 +300,17 @@ export type SubmitApplicationInput = {
   requiresCoverLetter: boolean;
   /** The listing's description text, when the scraper captured it. UNTRUSTED. Passed to ACT-007. */
   jobDescription?: string | null;
-  /** Code and/or link, for a row still sitting at `awaiting_verification`. Passed to ACT-007. */
+  /**
+   * Code and/or link, for a row still sitting at `awaiting_verification`. Passed
+   * to ACT-007.
+   *
+   * ACT-017 gives `verification.code` a second, non-overlapping use: when the
+   * fill did **not** need it (`fill.verification.required === false`, i.e. the
+   * row was never at `awaiting_verification`), it is taken as a human-supplied
+   * answer to the emailed security code Greenhouse gates submission behind, and
+   * short-circuits the Gmail poll. The two uses cannot collide, because the
+   * condition is exactly "ACT-007 did not spend it".
+   */
   verification?: VerificationInput;
   /**
    * ACT-015. The candidate's own answers to whatever a previous run reported in
@@ -315,6 +348,8 @@ export type SubmitApplicationResult = {
   confirmationRef: string | null;
   /** Everything the page said after the click. Null when nothing was clicked. */
   confirmation: ConfirmationCapture | null;
+  /** ACT-017. Null unless the board answered the first click by demanding an emailed code. */
+  securityCode: SecurityCodeReport | null;
   approval: ApprovalDecision & { gate: "auto" | "custom" };
   /** The label of the control that was clicked, or would have been. */
   submitControlLabel: string | null;
@@ -424,6 +459,12 @@ type PreflightRow = {
   company: string;
   jobTitle: string;
   confirmationRef: string | null;
+  /**
+   * ACT-017. The board the agent itself navigated to — the only evidence
+   * `allowedSenderDomains()` is willing to derive a mail-sender allowlist from.
+   * Read here rather than taken from a caller for exactly that reason.
+   */
+  applyUrl: string;
 };
 
 /**
@@ -442,7 +483,7 @@ async function preflight(
 ): Promise<PreflightRow> {
   const { data: rows, error } = await supabase
     .from("job_applications")
-    .select("status,company,job_title,confirmation_ref")
+    .select("status,company,job_title,confirmation_ref,apply_url")
     .eq("id", jobApplicationId)
     .limit(1);
   if (error) throw new Error(`job_applications lookup failed: ${error.message}`);
@@ -478,6 +519,7 @@ async function preflight(
     company: String(row.company ?? ""),
     jobTitle: String(row.job_title ?? ""),
     confirmationRef,
+    applyUrl: typeof row.apply_url === "string" ? row.apply_url : "",
   };
 }
 
@@ -718,6 +760,254 @@ export function corroborateSubmitControl(
 }
 
 // ───────────────────────────────────
+// ACT-017 — the emailed security code Greenhouse gates submission behind
+// ───────────────────────────────────
+
+/**
+ * ══ WHY THIS FILE NOW CONTAINS TWO CLICKS, AND WHY THAT IS STILL ONE SUBMISSION
+ *
+ * The rule this module was built around was "the submit control is clicked at
+ * most once, ever". That rule was a proxy for the thing actually being
+ * protected — **at most one application reaches the employer** — and on the
+ * first real run against Discord's Greenhouse board the proxy and the thing came
+ * apart. Greenhouse answered the click by *not* submitting: it re-rendered the
+ * same form, at the same URL, with a banner reading "A verification code was
+ * sent to … enter the 8-character code to confirm you're a human", an eight-box
+ * Security code field, and a greyed-out Submit button. The mail that arrived
+ * seconds later ended "After you enter the code, resubmit your application."
+ *
+ * A board whose own flow requires a second click is a board this module could
+ * never submit to, and the run correctly recorded `submission_unconfirmed`
+ * because it had no way to tell "rejected" from "accepted silently".
+ *
+ * So the invariant is restated, and the structure that enforces it changed with
+ * it:
+ *
+ *   1. There are exactly two `locator.click()` sites in this file, and the
+ *      second is reachable from **one** place: the branch taken when the read
+ *      after the first click showed the form still on screen, at the same URL,
+ *      with no confirmation of any kind — i.e. when the page itself says the
+ *      first click submitted nothing — *and* both a model reading the page and a
+ *      `document.querySelectorAll` sweep of it agree that a one-time code is
+ *      being demanded. Every other post-click path still ends at
+ *      `unconfirmed()`.
+ *   2. There is no third. `submitClicks` is incremented before each click and
+ *      checked before the second; there is no loop around either; and every exit
+ *      below the second click is `unconfirmed()` or the success path.
+ *   3. `submitAttempted` is still set before the *first* click and never
+ *      cleared, so everything after it — including this whole code flow —
+ *      remains incapable of producing a retryable status.
+ *   4. Every failure in here (no mail, no code in the mail, no field to type it
+ *      into, a field that will not take it, a Submit that stays disabled) stops
+ *      at `submission_unconfirmed` with a reason. None of them clicks again.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * How long to wait for the code mail before giving up.
+ *
+ * Short on purpose. A live Chrome is held open on a half-submitted application
+ * for the whole of this, boards expire sessions, and the real mail arrived
+ * within seconds of the click — so this is sized as "the mail is late", not "the
+ * mail may never come". If it expires, the run stops; it does not click again.
+ */
+const CODE_WAIT_TIMEOUT_MS = 150_000;
+const CODE_POLL_INTERVAL_MS = 5_000;
+
+/** How long the greyed-out Submit gets to notice the code before this gives up. */
+const SUBMIT_REENABLE_TIMEOUT_MS = 6_000;
+const SUBMIT_REENABLE_POLL_MS = 250;
+
+/**
+ * A control that wants the emailed code.
+ *
+ * Deliberately just the word, because the eight boxes of an OTP widget routinely
+ * carry no label of their own and this has to match on whatever scrap of text
+ * `enumerateFormFields` could find — a group label, an `aria-label`, a `name`.
+ * The narrowing is done by `NOT_A_SECURITY_CODE_RE` below and by the two
+ * independent gates in front of this being consulted at all.
+ */
+const SECURITY_CODE_FIELD_RE = /\bcodes?\b/i;
+
+/** …and every other kind of "code" a job application asks for. */
+const NOT_A_SECURITY_CODE_RE =
+  /\b(?:zip|postal|post|country|area|dial|phone|promo|discount|coupon|referral|invite|source|requisition|req|job|posting|employee|state|city|currency|language|colou?r)[\s_-]*codes?\b/i;
+
+/** Fewer boxes than this in a row is not a code widget, it is a form. */
+const MIN_CODE_BOXES = 4;
+
+/** What happened on the code leg, for the row's sake and the operator's. */
+export type SecurityCodeReport = {
+  /** The board answered the first click by asking for an emailed code. */
+  demanded: boolean;
+  /** Where the code came from. `"none"` when one was never obtained. */
+  source: "supplied" | "gmail" | "none";
+  /** The code reached the page and read back. */
+  entered: boolean;
+  /** The second — and last — submit click was issued. */
+  resubmitted: boolean;
+  detail: string;
+};
+
+const codeFieldText = (field: EnumeratedField): string =>
+  `${field.label} ${field.helpText} ${field.key}`;
+
+/**
+ * Every group of controls on the page that could be the security-code field,
+ * read from the DOM alone.
+ *
+ * Two shapes, because the widget has two. The first is what a labelled input
+ * looks like: one (or several) empty text controls whose own words say "code".
+ * The second is what Discord's Greenhouse page actually renders — a row of
+ * eight single-character boxes whose label lives on the group, not on any box,
+ * so a run of consecutive empty `maxlength="1"` text inputs *is* the evidence.
+ * `enumerateFormFields` walks `document.querySelectorAll` in document order, so
+ * "consecutive" here means "adjacent on the page".
+ *
+ * Only empty controls are ever offered: a box that already holds something is
+ * not a box this run may overwrite.
+ */
+export function securityCodeFieldGroups(
+  fields: readonly EnumeratedField[]
+): EnumeratedField[][] {
+  const typable = (field: EnumeratedField): boolean =>
+    (field.kind === "text" || field.kind === "textarea") && field.currentValue === "";
+
+  const labelled = fields.filter((field) => {
+    if (!typable(field)) return false;
+    const text = codeFieldText(field);
+    return SECURITY_CODE_FIELD_RE.test(text) && !NOT_A_SECURITY_CODE_RE.test(text);
+  });
+
+  const runs: EnumeratedField[][] = [];
+  let run: EnumeratedField[] = [];
+  for (const field of fields) {
+    if (typable(field) && field.maxLength === 1) {
+      run.push(field);
+      continue;
+    }
+    if (run.length >= MIN_CODE_BOXES) runs.push(run);
+    run = [];
+  }
+  if (run.length >= MIN_CODE_BOXES) runs.push(run);
+
+  return [labelled, ...runs].filter((group) => group.length > 0);
+}
+
+/**
+ * The one group that fits a code of exactly this length.
+ *
+ * Length-matched first and single-control second, in that order and not the
+ * other way round: a stray field that merely says "code" would otherwise beat
+ * the eight boxes that are demonstrably the widget. A group that is neither one
+ * control nor exactly one control per character is refused rather than
+ * half-filled — a code typed into the wrong number of boxes is a code the board
+ * will reject, on a page this run only gets to click once more.
+ */
+export function pickSecurityCodeGroup(
+  groups: readonly EnumeratedField[][],
+  codeLength: number
+): EnumeratedField[] | null {
+  return (
+    groups.find((group) => group.length === codeLength) ??
+    groups.find((group) => group.length === 1) ??
+    null
+  );
+}
+
+/**
+ * Types the code in, and confirms it landed.
+ *
+ * `applyFieldValue` is ACT-015's deterministic writer: a `locator.fill()` with
+ * the value as an argument, followed by a read-back of the control. No model, no
+ * instruction, nothing page-derived reaching anything that can act — the same
+ * property every other write in this pipeline has. Left to right for the
+ * multi-box case, which is the order a human types and the only order an
+ * auto-advancing widget expects.
+ */
+async function enterSecurityCode(
+  session: BrowserSession,
+  targets: readonly EnumeratedField[],
+  code: string
+): Promise<{ ok: true; detail: string } | { ok: false; why: string }> {
+  const single = targets.length === 1 ? targets[0] : undefined;
+  if (single !== undefined) {
+    const outcome = await applyFieldValue(session.page, single, code);
+    return outcome.ok
+      ? { ok: true, detail: `typed into one field labelled ${JSON.stringify(single.label)}` }
+      : {
+          ok: false,
+          why: `the code could not be typed into the security code field: ${outcome.detail}`,
+        };
+  }
+
+  for (const [index, field] of targets.entries()) {
+    const character = code[index];
+    if (character === undefined) {
+      return { ok: false, why: `the code ran out at box ${index + 1} of ${targets.length}` };
+    }
+    const outcome = await applyFieldValue(session.page, field, character);
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        why:
+          `character ${index + 1} of ${targets.length} would not go into the security code ` +
+          `field: ${outcome.detail}`,
+      };
+    }
+  }
+  return { ok: true, detail: `typed one character into each of ${targets.length} boxes` };
+}
+
+/**
+ * Is the control at `selector` disabled, as far as the DOM is concerned?
+ *
+ * Greenhouse greys its Submit button out until the code is accepted, so this is
+ * how the page tells us whether the code took — and it is the last check in
+ * front of the second click. `null` means the question could not be answered,
+ * which is treated as "do not click".
+ */
+async function readControlDisabled(
+  session: BrowserSession,
+  selector: string
+): Promise<boolean | null> {
+  const script = `(() => {
+    const sel = ${JSON.stringify(selector)};
+    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
+    let el = null;
+    try {
+      el = (path.startsWith("/") || path.startsWith("("))
+        ? document.evaluate(path, document, null, 9, null).singleNodeValue
+        : document.querySelector(sel);
+    } catch { return null; }
+    if (!el) return null;
+    return el.disabled === true
+      || el.hasAttribute("disabled")
+      || el.getAttribute("aria-disabled") === "true";
+  })()`;
+  try {
+    const value = await session.page.evaluate(script);
+    return typeof value === "boolean" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Polls `readControlDisabled` until the control is enabled, or time runs out. */
+async function waitForControlEnabled(
+  session: BrowserSession,
+  selector: string
+): Promise<boolean | null> {
+  const deadline = Date.now() + SUBMIT_REENABLE_TIMEOUT_MS;
+  let disabled = await readControlDisabled(session, selector);
+  while (disabled === true && Date.now() < deadline) {
+    await session.page.waitForTimeout(SUBMIT_REENABLE_POLL_MS);
+    disabled = await readControlDisabled(session, selector);
+  }
+  return disabled === null ? null : !disabled;
+}
+
+// ───────────────────────────────────
 // The confirmation
 // ───────────────────────────────────
 
@@ -875,6 +1165,7 @@ export async function submitApplication(
       submitAttempted: false,
       confirmationRef: null,
       confirmation: null,
+      securityCode: null,
       approval: { approved: false, gate: gateName(input), detail: "never reached — the fill stopped first" },
       submitControlLabel: null,
       fill,
@@ -939,6 +1230,20 @@ async function runSubmitPhase(
    */
   let submitAttempted = false;
 
+  /**
+   * ACT-017. How many times the submit control has been pressed on this run.
+   *
+   * `submitAttempted` answers "may this run report a retryable status" and is
+   * one-way; this answers "how many clicks have there been", which is a
+   * different question now that the answer can legitimately be two. Checked
+   * immediately before the second click, so a future edit that finds another
+   * route into that block gets a hard stop rather than a third application.
+   */
+  let submitClicks = 0;
+
+  /** ACT-017. Null until the board demands a code; the report of that leg after. */
+  let securityCode: SecurityCodeReport | null = null;
+
   /** Assembles a result, reading the page and saving a screenshot best-effort. */
   const finish = async (terminal: {
     status: ApplicationStatus;
@@ -959,6 +1264,7 @@ async function runSubmitPhase(
     return {
       jobApplicationId,
       submitAttempted,
+      securityCode,
       approval,
       submitControlLabel,
       fill,
@@ -1054,6 +1360,77 @@ async function runSubmitPhase(
       confirmationRef: null,
       confirmation: null,
       blockedReason: why,
+      unconfirmedReason: null,
+      rowUpdated,
+    });
+  };
+
+  /**
+   * The same three-signal test `create-board-account.ts` applies after its
+   * signup submit, with the board's own confirmation wording added as the
+   * strongest of them: a confirmation message, the form having gone, or the
+   * board having moved us somewhere else. None of the three is conclusive alone;
+   * all three absent is a submission that did not take.
+   *
+   * Lifted into a function by ACT-017 so both clicks are judged by exactly the
+   * same rule rather than by two copies of it that can drift. `wasAt` is the URL
+   * the page was on immediately before the click being judged.
+   */
+  const looksSubmitted = (capture: ConfirmationCapture, wasAt: string): boolean =>
+    capture.confirmationPresent ||
+    !capture.applicationFormStillPresent ||
+    !samePage(capture.url, wasAt);
+
+  /**
+   * The success exit, shared by both clicks.
+   *
+   * Same never-throw discipline as `unconfirmed`, and for the same reason: the
+   * application is already at the employer, so a failure to write that down must
+   * resolve rather than reject. A row that under-reports a real submission is
+   * bad; an exception that invites something upstream to submit it again is far
+   * worse.
+   */
+  const succeed = async (
+    capture: ConfirmationCapture,
+    wasAt: string,
+    how: string
+  ): Promise<SubmitApplicationResult> => {
+    const confirmationRef = buildConfirmationRef(capture);
+    console.log(
+      `${LOG} submitted (${how}). confirmation_ref = ${JSON.stringify(confirmationRef)} ` +
+        `(confirmation page: ${capture.confirmationPresent}, ` +
+        `form gone: ${!capture.applicationFormStillPresent}, ` +
+        `navigated: ${!samePage(capture.url, wasAt)})`
+    );
+
+    let rowUpdated = false;
+    try {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.SUBMITTED,
+        confirmation_ref: confirmationRef,
+        error_message: null,
+      });
+      rowUpdated = true;
+      console.log(
+        `${LOG} job_applications ${jobApplicationId} → ${APPLICATION_STATUS.SUBMITTED}`
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `${LOG} the application WAS submitted and the board confirmed it, but recording ` +
+          `${APPLICATION_STATUS.SUBMITTED} on job_applications ${jobApplicationId} failed: ` +
+          `${reason}. The row still reads its previous status and a human must fix it by hand — ` +
+          `confirmation_ref would have been ${JSON.stringify(confirmationRef)}. Not retrying ` +
+          `anything, and not reporting a failure status: the submission itself succeeded.`
+      );
+    }
+
+    return await finish({
+      status: APPLICATION_STATUS.SUBMITTED,
+      submitted: true,
+      confirmationRef,
+      confirmation: capture,
+      blockedReason: null,
       unconfirmedReason: null,
       rowUpdated,
     });
@@ -1164,6 +1541,10 @@ async function runSubmitPhase(
     // `setInputFiles` instead of an act().
     console.log(`${LOG} clicking "${choice.label}" — this is the irreversible step`);
     submitAttempted = true;
+    submitClicks = 1;
+    // The instant the click went out. ACT-017's lower bound on the mailbox
+    // search: nothing that arrived before this can be an answer to it.
+    const clickedAtMs = Date.now();
     try {
       await locator.click({ clickCount: 1 });
     } catch (err) {
@@ -1188,71 +1569,255 @@ async function runSubmitPhase(
       );
     }
 
-    // Same three-signal test `create-board-account.ts` applies after its signup
-    // submit, with the board's own confirmation wording added as the strongest
-    // of them: a confirmation message, the form having gone, or the board having
-    // moved us somewhere else. None of the three is conclusive alone; all three
-    // absent is a submission that probably did not take.
-    const confirmed = capture.confirmationPresent;
-    const formGone = !capture.applicationFormStillPresent;
-    const movedOn = !samePage(capture.url, fill.finalUrl);
-    if (!confirmed && !formGone && !movedOn) {
-      const errors = capture.validationErrorsShown
-        ? ` The page is showing errors: ${JSON.stringify(
-            sanitizePageText(capture.validationErrorText, 300)
-          )}.`
-        : "";
+    if (looksSubmitted(capture, fill.finalUrl)) {
+      return await succeed(capture, fill.finalUrl, `the "${choice.label}" click`);
+    }
+
+    // ══ ACT-017: the first click submitted nothing ═══════════════════════════
+    // Everything below is reachable ONLY from here, and "here" is the page
+    // itself saying, in the only three ways this module can read it, that the
+    // application did not go: the form is still on screen, at the same URL, with
+    // no confirmation of any kind. That is the entire entry condition for a
+    // second click, and it is the branch that used to end unconditionally at
+    // `unconfirmed()`.
+    const errors = capture.validationErrorsShown
+      ? ` The page is showing errors: ${JSON.stringify(
+          sanitizePageText(capture.validationErrorText, 300)
+        )}.`
+      : "";
+
+    // Two independent readings have to agree before a code is even looked for:
+    // a model's account of what the page is asking (`securityCodeRequested`) and
+    // a `document.querySelectorAll` sweep that finds something to type it into.
+    // Either alone is a reason to stop, not a reason to proceed.
+    const groups = securityCodeFieldGroups(await enumerateFormFields(session.page));
+    if (!capture.securityCodeRequested || groups.length === 0) {
       return await unconfirmed(
         `"${choice.label}" was clicked, but the application form is still on screen at ` +
           `"${capture.url}" with no confirmation of any kind — the board most likely rejected ` +
-          `the submission (validation, or an anti-bot check).${errors} "Most likely" is not ` +
-          `"certainly", so this is not being retried: a human should look at the board before ` +
-          `anything clicks here again.`
+          `the submission (validation, or an anti-bot check).${errors} ` +
+          (capture.securityCodeRequested
+            ? `The page reads as asking for an emailed one-time code, but no empty code field ` +
+              `could be found in the DOM to type one into. `
+            : groups.length > 0
+              ? `An empty code-shaped field is present but the page does not read as asking for ` +
+                `an emailed code. `
+              : "") +
+          `"Most likely" is not "certainly", so this is not being retried: a human should look ` +
+          `at the board before anything clicks here again.`
       );
     }
 
-    const confirmationRef = buildConfirmationRef(capture);
+    securityCode = {
+      demanded: true,
+      source: "none",
+      entered: false,
+      resubmitted: false,
+      detail: "the board asked for an emailed one-time code before it would accept the application",
+    };
     console.log(
-      `${LOG} submitted. confirmation_ref = ${JSON.stringify(confirmationRef)} ` +
-        `(confirmation page: ${confirmed}, form gone: ${formGone}, navigated: ${movedOn})`
+      `${LOG} the board did not accept the submission — it is asking for an emailed security ` +
+        `code (${groups.map((group) => `${group.length} field(s)`).join(" or ")} on the page). ` +
+        `Greenhouse's own mail says to enter it and resubmit; that is what happens next.`
     );
 
-    // Same never-throw discipline once more, and for the last time: the
-    // application is already at the employer, so a failure to write that down
-    // must resolve rather than reject. A row that under-reports a real
-    // submission is bad; an exception that invites something upstream to submit
-    // it again is far worse.
-    let rowUpdated = false;
-    try {
-      await updateApplication(supabase, jobApplicationId, {
-        status: APPLICATION_STATUS.SUBMITTED,
-        confirmation_ref: confirmationRef,
-        error_message: null,
-      });
-      rowUpdated = true;
+    // ── Step 1: get the code ─────────────────────────────────────────────────
+    // A human-supplied one wins, and costs nothing when the mail is slow. It is
+    // only read as a security code when ACT-007 did not already spend it on the
+    // signup verification, so the two meanings of `--verification-code` cannot
+    // collide.
+    const offered = fill.verification.required ? null : (input.verification?.code ?? null);
+    const supplied = offered === null ? null : offered.trim() || null;
+
+    let code: string;
+    if (supplied !== null) {
+      code = supplied;
+      securityCode.source = "supplied";
+      securityCode.detail = `a ${code.length}-character code was supplied on the command line`;
+      console.log(`${LOG} using the supplied ${code.length}-character code (skipping the mailbox)`);
+    } else {
+      const domains = allowedSenderDomains(row.applyUrl);
+      if (domains.length === 0) {
+        return await unconfirmed(
+          `"${choice.label}" was clicked and the board answered by asking for an emailed ` +
+            `security code, but no sender domain could be derived from this row's apply_url ` +
+            `(${JSON.stringify(row.applyUrl)}), so there is no scoped mailbox search to run and ` +
+            `nothing safe to read. Pass the code with --verification-code and re-run, or finish ` +
+            `the application by hand. Nothing was clicked again.`
+        );
+      }
+
       console.log(
-        `${LOG} job_applications ${jobApplicationId} → ${APPLICATION_STATUS.SUBMITTED}`
+        `${LOG} watching the ACT-006 mailbox for a code from ${domains.join(", ")} sent after ` +
+          `the click, for up to ${Math.round(CODE_WAIT_TIMEOUT_MS / 1000)}s`
       );
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.error(
-        `${LOG} the application WAS submitted and the board confirmed it, but recording ` +
-          `${APPLICATION_STATUS.SUBMITTED} on job_applications ${jobApplicationId} failed: ` +
-          `${reason}. The row still reads its previous status and a human must fix it by hand — ` +
-          `confirmation_ref would have been ${JSON.stringify(confirmationRef)}. Not retrying ` +
-          `anything, and not reporting a failure status: the submission itself succeeded.`
+      let waited: Awaited<ReturnType<typeof waitForMailboxCode>>;
+      try {
+        const { gmail } = createGmailClient();
+        waited = await waitForMailboxCode({
+          gmail,
+          domains,
+          sinceMs: clickedAtMs,
+          timeoutMs: CODE_WAIT_TIMEOUT_MS,
+          intervalMs: CODE_POLL_INTERVAL_MS,
+          log: (line) => console.log(`${LOG} ${line}`),
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        return await unconfirmed(
+          `"${choice.label}" was clicked and the board asked for an emailed security code, but ` +
+            `the mailbox could not be read: ${reason}. The application has NOT been submitted — ` +
+            `the form is still on screen — but nothing here will click again. Fix the Gmail ` +
+            `credentials, or finish it by hand.`
+        );
+      }
+      if (!waited.found) {
+        securityCode.detail = `no code arrived: ${waited.reason}`;
+        return await unconfirmed(
+          `"${choice.label}" was clicked and the board asked for an emailed security code, but ` +
+            `none could be read from the mailbox: ${waited.reason}. The application has NOT ` +
+            `been submitted — Greenhouse is still showing the filled form and its code prompt. ` +
+            `Nothing was clicked again.`
+        );
+      }
+      code = waited.hit.code;
+      securityCode.source = "gmail";
+      securityCode.detail =
+        `a ${code.length}-character code arrived from ${waited.hit.senderDomain} at ` +
+        `${new Date(waited.hit.receivedAtMs).toISOString()}`;
+      // Its shape, never its value — a single-use credential, same rule ACT-006
+      // logs by.
+      console.log(
+        `${LOG} ${code.length}-character code received from ${waited.hit.senderDomain} ` +
+          `(gmail message ${waited.hit.gmailMessageId})`
       );
     }
 
-    return await finish({
-      status: APPLICATION_STATUS.SUBMITTED,
-      submitted: true,
-      confirmationRef,
-      confirmation: capture,
-      blockedReason: null,
-      unconfirmedReason: null,
-      rowUpdated,
-    });
+    // ── Step 2: type it in ───────────────────────────────────────────────────
+    // Re-read rather than reusing the enumeration above: minutes may have passed
+    // waiting for mail, and a selector is only worth as much as the page it was
+    // read off.
+    const targets = pickSecurityCodeGroup(
+      securityCodeFieldGroups(await enumerateFormFields(session.page)),
+      code.length
+    );
+    if (targets === null) {
+      securityCode.detail = `no field on the page fits a ${code.length}-character code`;
+      return await unconfirmed(
+        `"${choice.label}" was clicked, the board asked for an emailed security code and one ` +
+          `arrived, but no empty field on the page fits a ${code.length}-character code. The ` +
+          `application has NOT been submitted. Nothing was clicked again.`
+      );
+    }
+    const typed = await enterSecurityCode(session, targets, code);
+    if (!typed.ok) {
+      securityCode.detail = typed.why;
+      return await unconfirmed(
+        `"${choice.label}" was clicked and the board asked for an emailed security code, which ` +
+          `arrived, but ${typed.why}. The application has NOT been submitted. Nothing was ` +
+          `clicked again.`
+      );
+    }
+    securityCode.entered = true;
+    console.log(`${LOG} security code entered — ${typed.detail}`);
+
+    // ── Step 3: the resubmit. The second click, and the last one there is ────
+    if (submitClicks !== 1) {
+      return await unconfirmed(
+        `internal guard: the resubmit step was reached with ${submitClicks} click(s) already ` +
+          `issued. Refusing to press a submit control a third time under any circumstances.`
+      );
+    }
+
+    // The same corroboration the first click passed, run again on the same
+    // selector — the page re-rendered around the code prompt, and a control that
+    // has become something else is a control this does not press.
+    const resubmitDescriptor = await describeControl(session.page, selector);
+    const resubmitCheck = corroborateSubmitControl(resubmitDescriptor, choice.label);
+    if (!resubmitCheck.ok) {
+      return await unconfirmed(
+        `the security code was entered, but the submit control can no longer be corroborated: ` +
+          `${resubmitCheck.why} The application has NOT been submitted and nothing was clicked ` +
+          `again.`
+      );
+    }
+    const resubmitMatches = await locator.count();
+    if (resubmitMatches !== 1) {
+      return await unconfirmed(
+        `the security code was entered, but the selector for the "${choice.label}" control now ` +
+          `matches ${resubmitMatches} elements. The application has NOT been submitted and ` +
+          `nothing was clicked again.`
+      );
+    }
+    if (!(await locator.isVisible())) {
+      return await unconfirmed(
+        `the security code was entered, but the "${choice.label}" control is no longer visible. ` +
+          `The application has NOT been submitted and nothing was clicked again.`
+      );
+    }
+    // Greenhouse greys Submit out until it accepts the code, so this is the
+    // board's own verdict on what was typed — and the last check in front of the
+    // second click.
+    const enabled = await waitForControlEnabled(session, selector);
+    if (enabled !== true) {
+      securityCode.detail =
+        enabled === null
+          ? "the submit control's enabled state could not be read after the code was entered"
+          : "the board left the submit control disabled after the code was entered";
+      return await unconfirmed(
+        `the security code was entered, but ${securityCode.detail} — which is the board saying ` +
+          `it has not accepted the code. The application has NOT been submitted and nothing was ` +
+          `clicked again.`
+      );
+    }
+
+    const resubmitFrom = capture.url;
+    console.log(`${LOG} resubmitting "${choice.label}" with the security code — the second and final click`);
+    submitClicks = 2;
+    try {
+      await locator.click({ clickCount: 1 });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return await unconfirmed(
+        `the resubmit click on "${choice.label}" at "${resubmitFrom}" failed part-way through: ` +
+          `${reason}. Whether the board received the application is unknown — a click that ` +
+          `throws is not a click that did not happen. Not retrying.`
+      );
+    }
+    securityCode.resubmitted = true;
+
+    let resubmitCapture: ConfirmationCapture;
+    try {
+      resubmitCapture = await readConfirmation(session);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return await unconfirmed(
+        `"${choice.label}" was resubmitted with the security code at "${resubmitFrom}", but the ` +
+          `page could not be read afterwards: ${reason}. The application may well have gone ` +
+          `through; nothing here can tell. Not retrying.`
+      );
+    }
+
+    if (looksSubmitted(resubmitCapture, resubmitFrom)) {
+      return await succeed(
+        resubmitCapture,
+        resubmitFrom,
+        `the resubmit of "${choice.label}" after the emailed security code`
+      );
+    }
+
+    const resubmitErrors = resubmitCapture.validationErrorsShown
+      ? ` The page is showing errors: ${JSON.stringify(
+          sanitizePageText(resubmitCapture.validationErrorText, 300)
+        )}.`
+      : "";
+    return await unconfirmed(
+      `"${choice.label}" was clicked a second time with the emailed security code entered, and ` +
+        `the application form is STILL on screen at "${resubmitCapture.url}" with no ` +
+        `confirmation of any kind — the board most likely rejected it again (a wrong or expired ` +
+        `code, or an anti-bot check).${resubmitErrors} There is no third click: a human should ` +
+        `look at the board and at the ACT-006 inbox before anything clicks here again.`
+    );
   } catch (err) {
     // The catch-all, and it must be unreachable-in-practice rather than
     // load-bearing: every expected stop above returns through `blocked()` or
