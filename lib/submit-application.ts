@@ -82,6 +82,7 @@ import {
 } from "./fill-application-form.js";
 import {
   closeBrowserSession,
+  forgetAction,
   samePage,
   tryResolveAction,
   type BrowserSession,
@@ -1778,10 +1779,46 @@ async function runSubmitPhase(
       );
     }
 
-    // The same corroboration the first click passed, run again on the same
-    // selector — the page re-rendered around the code prompt, and a control that
-    // has become something else is a control this does not press.
-    const resubmitDescriptor = await describeControl(session.page, selector);
+    // The same corroboration the first click passed, run again — but not
+    // necessarily against the same selector.
+    //
+    // Stagehand's selectors are absolute XPaths, and inserting the security-code
+    // section shifts every sibling after it: the button observed before the
+    // click as `…/form[1]/div[5]/button[1]` is a different index once the prompt
+    // exists, so re-checking the original path finds nothing and reads exactly
+    // like a vanished control. That is what stopped a live run one step from the
+    // end, with the code already typed into all eight boxes.
+    //
+    // So a stale path is re-derived rather than treated as a missing button: the
+    // cached observation is dropped and the control located again on the page as
+    // it now is. Nothing is relaxed by this — whatever comes back must pass the
+    // identical `corroborateSubmitControl` (its own text must read as submitting
+    // *this* application), must be the only match, must be visible, and must be
+    // enabled by the board before anything is clicked. The alternative would be
+    // trusting a DOM position across a re-render, which is the weaker claim.
+    let resubmitSelector = selector;
+    let resubmitDescriptor = await describeControl(session.page, resubmitSelector);
+    if (!resubmitDescriptor.found) {
+      console.warn(
+        `${LOG} the submit control's original selector no longer resolves (the page re-rendered ` +
+          `around the code prompt) — locating it again on the current page`
+      );
+      await forgetAction(resolved.cacheKey, LOG);
+      const relocated = await tryResolveAction(
+        session,
+        fill.finalUrl,
+        INSTRUCTIONS.SUBMIT_APPLICATION
+      );
+      if (relocated === null) {
+        return await unconfirmed(
+          `the security code was entered, but the submit control could no longer be located on ` +
+            `the page at all. The application has NOT been submitted and nothing was clicked ` +
+            `again.`
+        );
+      }
+      resubmitSelector = relocated.action.selector;
+      resubmitDescriptor = await describeControl(session.page, resubmitSelector);
+    }
     const resubmitCheck = corroborateSubmitControl(resubmitDescriptor, choice.label);
     if (!resubmitCheck.ok) {
       return await unconfirmed(
@@ -1790,7 +1827,10 @@ async function runSubmitPhase(
           `again.`
       );
     }
-    const resubmitMatches = await locator.count();
+    // Re-derived from whichever selector corroborated, so every check below and
+    // the click itself act on the same element.
+    const resubmitLocator = session.page.locator(resubmitSelector);
+    const resubmitMatches = await resubmitLocator.count();
     if (resubmitMatches !== 1) {
       return await unconfirmed(
         `the security code was entered, but the selector for the "${choice.label}" control now ` +
@@ -1798,7 +1838,7 @@ async function runSubmitPhase(
           `nothing was clicked again.`
       );
     }
-    if (!(await locator.isVisible())) {
+    if (!(await resubmitLocator.isVisible())) {
       return await unconfirmed(
         `the security code was entered, but the "${choice.label}" control is no longer visible. ` +
           `The application has NOT been submitted and nothing was clicked again.`
@@ -1807,7 +1847,7 @@ async function runSubmitPhase(
     // Greenhouse greys Submit out until it accepts the code, so this is the
     // board's own verdict on what was typed — and the last check in front of the
     // second click.
-    const enabled = await waitForControlEnabled(session, selector);
+    const enabled = await waitForControlEnabled(session, resubmitSelector);
     if (enabled !== true) {
       securityCode.detail =
         enabled === null
@@ -1824,7 +1864,7 @@ async function runSubmitPhase(
     console.log(`${LOG} resubmitting "${choice.label}" with the security code — the second and final click`);
     submitClicks = 2;
     try {
-      await locator.click({ clickCount: 1 });
+      await resubmitLocator.click({ clickCount: 1 });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
