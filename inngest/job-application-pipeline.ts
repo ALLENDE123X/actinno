@@ -424,9 +424,27 @@ export const applyToJob = inngest.createFunction(
   {
     id: "apply-to-job",
     triggers: [{ event: jobApplicationRequested }],
-    // Five listings in flight = five Chrome processes on this machine. The limit
-    // is the reason `createBoardAccount` closes its browser on every exit path.
-    concurrency: { limit: 5 },
+    // Listings in flight = Chrome processes on this machine, which is why
+    // `createBoardAccount` closes its browser on every exit path.
+    //
+    // Two, not five, and the reason is memory rather than taste. A 5-wide
+    // fan-out on an 8 GB machine put the load average at 32 on 8 cores and
+    // pushed swap to 5 GB of 6 GB, at which point Chrome does not fail
+    // cleanly — it stops answering CDP ("RPC response timed out: page.title")
+    // or dies outright ("connect ECONNREFUSED"). Four real applications were
+    // lost that way in one run, none of them for any reason to do with the
+    // application itself.
+    //
+    // A headless Chrome on a heavy ATS page is roughly 700 MB, and it shares
+    // this machine with the Inngest processes, Claude Desktop and the user's
+    // own browser. Two fit. Five did not.
+    //
+    // This is a property of the host, not of the pipeline: on a 32 GB machine
+    // five would be comfortable and this should go back up. The launch
+    // semaphore in `stagehand-session.ts` solves a different problem —
+    // simultaneous cold starts — and does not help once the browsers are all
+    // resident.
+    concurrency: { limit: 2 },
     // Below Inngest's default of 4, because a retry here is not free: each one
     // relaunches a browser against a real employer's site. Two is enough for the
     // failures retrying actually fixes (a flaky navigation, a Supabase blip) and

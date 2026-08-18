@@ -1045,6 +1045,22 @@ async function updateApplication(
   }
 }
 
+/**
+ * How much of a failure message survives onto the row.
+ *
+ * This was 2000, on the reasoning that a full stack dump in a status table
+ * helps nobody. That is right for a stack trace and badly wrong for the other
+ * thing that comes through here: the `needsInput` questions, which are the
+ * whole mechanism by which a blocked application reaches a human.
+ *
+ * A real SoFi form asked 49 required questions. The list was written here,
+ * truncated at 2000 characters, and the caller saw four of them — so 45
+ * questions the candidate had to answer were simply unreachable, and the
+ * application could never be completed by anyone. `error_message` is an
+ * unbounded `text` column; the cap was protecting nothing.
+ */
+const MAX_ERROR_MESSAGE_CHARS = 16_000;
+
 /** Records a failure on the row. Best-effort; never throws over the original error. */
 async function recordFailure(
   supabase: SupabaseClient,
@@ -1052,7 +1068,10 @@ async function recordFailure(
   status: ApplicationStatus,
   message: string
 ): Promise<void> {
-  const trimmed = message.length > 2000 ? `${message.slice(0, 2000)}…` : message;
+  const trimmed =
+    message.length > MAX_ERROR_MESSAGE_CHARS
+      ? `${message.slice(0, MAX_ERROR_MESSAGE_CHARS)}…`
+      : message;
   try {
     await updateApplication(supabase, jobApplicationId, { status, error_message: trimmed });
     console.error(`${LOG} job_applications ${jobApplicationId} → ${status}: ${trimmed}`);
