@@ -38,6 +38,69 @@
  * type into a control that does not describe itself as the field we meant, and
  * every filled field is read back out of the browser afterwards.
  *
+ * ── ACT-015: unlimited field coverage, and better injection properties ──────
+ * Layer 2 above had a cost nobody priced: a field nobody enumerated in advance
+ * was structurally invisible. `INSTRUCTIONS` names first name, last name, email,
+ * phone, LinkedIn, website, resume and cover letter, so a real Discord
+ * Greenhouse form came back with a required country dropdown, a required essay,
+ * three required work-authorization questions and four required EEO selects all
+ * blank — a form the board's own validation would reject. That is a static
+ * script with a model in the loop, not something that adapts to the form it
+ * lands on.
+ *
+ * Dynamism and containment were never in tension; they had just been fused. The
+ * field layer is now three separate things:
+ *
+ *  · **Perception** — `enumerateFormFields()` in `form-fields.ts` reads the DOM
+ *    and reports *every* control: label, kind, required flag, current value, and
+ *    the real option strings behind a dropdown. No model at all. Reading a page
+ *    was never the dangerous part.
+ *
+ *  · **Decision** — `decideFieldAnswers()` in `resume-parser.ts`, one call with
+ *    **no tools attached**, guarded by the same `assertNoActionSurface()` the
+ *    resume parse and the cover letter already use. Untrusted form labels reach
+ *    it, and the worst they can achieve is a wrong *string* in a JSON field,
+ *    because the thing holding them cannot click, navigate, upload or submit.
+ *
+ *  · **Action** — `applyFieldValue()` in `form-fields.ts`, no model, no
+ *    natural-language instruction: a `fill`, a `selectOption` or a `click` on an
+ *    element addressed by a selector the perception pass computed. In particular
+ *    no page-derived label is ever concatenated into an instruction, which is
+ *    the residual risk earlier reviews flagged in ACT-005's apply-click; this
+ *    layer does not reintroduce it.
+ *
+ * The net effect is strictly better than before: every value that reaches the
+ * page must be either an option the DOM itself offers or a candidate fact this
+ * system already validated, and `INSTRUCTIONS` is still the complete list of
+ * sentences any action-capable model sees.
+ *
+ * ── The answering policy ────────────────────────────────────────────────────
+ * These are legally meaningful statements made to a real employer under a real
+ * person's name, so every field is categorised (`resolveDecision` below):
+ *
+ *  · **Answered from stored data** — work authorization, sponsorship, country,
+ *    city, relocation — from the `candidates` columns ACT-015 added, collected
+ *    once at intake. A value must trace to a named fact in a closed catalogue.
+ *  · **Generated** — free-text essay questions ("Why do you want to work at
+ *    Discord?"), which are a cover letter under another name and go through the
+ *    same generator, fed the *validated profile*, never raw resume text.
+ *  · **Declined** — every EEO/demographic question, always, by selecting its
+ *    "decline to self-identify" option. Declining is truthful; inventing a
+ *    demographic identity for a real person is not, and cannot happen here: the
+ *    rule is a regex on the field's own label applied in TypeScript, not an
+ *    instruction the model is trusted to follow.
+ *  · **Never guessed** — anything factual with no backing data stops and asks.
+ *    A model asserting "yes, authorized to work in the US" on someone's behalf
+ *    is a material misrepresentation, and this is the single rule the rest of
+ *    the design exists to make mechanical.
+ *
+ * When a required field cannot be answered truthfully the run does not guess and
+ * does not silently skip: it returns `needsInput`, a structured list of what it
+ * still needs, alongside everything it did fill. The caller asks the user, then
+ * re-invokes with `additionalAnswers` and it finishes. That loop is stateless —
+ * nothing is stored between the two calls, and the keys are derived from the
+ * form's own labels so the second run recomputes them identically.
+ *
  * ── Why this is one self-contained, re-entrant call ─────────────────────────
  * Inngest steps are independently retried and resumed, and a Playwright/Stagehand
  * page handle is not serialisable, so a browser cannot be carried from ACT-005's
@@ -95,13 +158,33 @@ import {
   type CachedAction,
 } from "./stagehand-session.js";
 import {
+  decideFieldAnswers,
   generateCoverLetter,
+  generateEssayAnswer,
   loadResume,
   parseResume,
   InjectionSuspectedError,
+  type CandidateFact,
   type CandidateRecord,
+  type DecidableField,
+  type FieldDecision,
   type ResumeProfile,
 } from "./resume-parser.js";
+import {
+  applyFieldValue,
+  enumerateFormFields,
+  findDeclineOption,
+  DECLINE_OPTION_RE,
+  harvestOptions,
+  inPageError,
+  inPageExpression,
+  normalizeText,
+  CONSENT_FIELD_RE,
+  EEO_FIELD_RE,
+  type EnumeratedField,
+  type FormFieldKind,
+} from "./form-fields.js";
+import { toApplicationAnswers, type CandidateApplicationAnswers } from "./candidate-intake.js";
 
 const LOG = "[act-007]";
 
@@ -413,9 +496,25 @@ const NO_CONTROL: ControlDescriptor = {
  */
 export async function describeControl(page: Page, selector: string): Promise<ControlDescriptor> {
   try {
-    const raw = (await page.evaluate(
-      `(${describeControlInPage.toString()})(${jsExpression(selector)})`
-    )) as Partial<ControlDescriptor> | null;
+    // ACT-015: `inPageExpression` rather than a bare `toString()`. Under `tsx`,
+    // esbuild wraps every named function in its own `__name(…)` helper, which is
+    // defined in the module and undefined in the page — so this function threw
+    // on its first line on every page it was ever used on, returned
+    // `found: false` every time, and was reported as "the form is probably
+    // inside an iframe". It was not. See `inPageExpression`'s comment.
+    //
+    // The consequence of the fix is that `corroborate()` now checks the DOM
+    // truth it was written to check, instead of silently falling back to the
+    // reader's own description on every field.
+    const result = await page.evaluate(
+      inPageExpression(describeControlInPage, jsExpression(selector))
+    );
+    const failure = inPageError(result);
+    if (failure !== null) {
+      console.warn(`${LOG} could not describe the control at ${selector}: ${failure}`);
+      return NO_CONTROL;
+    }
+    const raw = result as Partial<ControlDescriptor> | null;
     if (!raw || typeof raw !== "object") return NO_CONTROL;
     return {
       found: raw.found === true,
@@ -763,16 +862,61 @@ export type FillApplicationFormInput = {
   headless?: boolean;
   /** Where to write the filled-but-not-submitted screenshot. Default `lib/.form-fill-screenshots`. */
   screenshotDir?: string;
+  /**
+   * ACT-015. The user's own answers to whatever a previous run reported in
+   * `needsInput`, keyed by that item's `key` (which is the form's own label,
+   * folded to lower case).
+   *
+   * This is the resume half of the pause/ask/resume loop, and it is deliberately
+   * the *only* half: there is no session handle, no stored pending-question
+   * record and no new table. The caller re-invokes the same function with the
+   * same `jobApplicationId` and these answers merged in; everything else — the
+   * page, the field list, the keys — is re-derived from scratch, which is what
+   * makes a stateless second call land on the same fields as the first.
+   *
+   * Values are typed into a real employer's form verbatim (sanitised to one
+   * line), or, for a dropdown, matched against the options the page offers. An
+   * answer that matches no option is reported back rather than approximated.
+   */
+  additionalAnswers?: Record<string, string>;
 };
 
 export type FieldOutcome = {
-  field: FieldKey | "resume";
+  /**
+   * The field's name. One of `FIELD_KEYWORDS`' keys or `"resume"` for the fields
+   * ACT-007 knows by name; for everything else (ACT-015) it is the form's own
+   * visible label, folded to lower case — the same string `needsInput[].key`
+   * uses, so a report and a question can be lined up by eye.
+   */
+  field: string;
   /** What this module meant to put there. */
   intended: string | null;
-  outcome: "filled" | "not-on-form" | "skipped" | "mismatch";
+  outcome: "filled" | "not-on-form" | "skipped" | "mismatch" | "declined" | "needs-input";
   detail: string;
   /** What the browser reads back out of the control afterwards. */
   readBack?: string | null;
+};
+
+/**
+ * ACT-015 — one thing the run could not answer truthfully and will not guess at.
+ *
+ * Returned rather than thrown, alongside whatever *was* filled, so the caller
+ * has something to put to the user rather than an error string to relay.
+ */
+export type NeedsInputItem = {
+  /** Echo this back as a key of `additionalAnswers` to answer it. */
+  key: string;
+  /** The label exactly as it appears on the form. */
+  fieldLabel: string;
+  /** The question to put to the candidate, in plain second person. */
+  question: string;
+  /** Why this could not be answered from what is already known. */
+  why: string;
+  /** True when the board will refuse the application without it. */
+  required: boolean;
+  kind: FormFieldKind;
+  /** The choices the form offers, when it offers a fixed set. */
+  options?: string[];
 };
 
 export type FillApplicationFormResult = {
@@ -787,6 +931,16 @@ export type FillApplicationFormResult = {
     detail: string;
   };
   fields: FieldOutcome[];
+  /**
+   * ACT-015. Required fields the run refused to guess at, and the questions that
+   * would unblock them. Empty on a run that could answer everything.
+   *
+   * A non-empty list with `required: true` in it is always accompanied by
+   * `status: "form_fill_blocked"` and `blockedReason`, because a form with a
+   * required field still empty cannot be submitted anyway — so ACT-008 never
+   * sees a live session for one of these.
+   */
+  needsInput: NeedsInputItem[];
   coverLetter: {
     required: boolean;
     generated: boolean;
@@ -919,6 +1073,12 @@ type ApplicationState = {
   status: string;
   boardPassword: string | null;
   candidate: CandidateRecord & { resumeUrl: string };
+  /**
+   * ACT-015. The reusable form answers intake collected, or `{}` when it
+   * collected none. An absent key means "never asked", and the fill layer turns
+   * that into a question for the candidate rather than a value on a form.
+   */
+  applicationAnswers: CandidateApplicationAnswers;
 };
 
 /**
@@ -979,7 +1139,13 @@ async function loadApplicationState(
   const candidateId = String(row.candidate_id ?? "");
   const { data: candidateRows, error: candidateError } = await supabase
     .from("candidates")
-    .select("id,resume_url,linkedin_url,application_email")
+    // ACT-015's additive columns are named explicitly rather than reached with
+    // `*`, so a row written before the migration reads back as "never asked"
+    // instead of failing. One string literal, not a concatenation: supabase-js
+    // infers the row type from the literal it is handed.
+    .select(
+      "id,resume_url,linkedin_url,application_email,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate"
+    )
     .eq("id", candidateId)
     .limit(1);
   if (candidateError) throw new Error(`candidates lookup failed: ${candidateError.message}`);
@@ -1007,6 +1173,7 @@ async function loadApplicationState(
       linkedinUrl: typeof candidate.linkedin_url === "string" ? candidate.linkedin_url : null,
       resumeUrl: String(candidate.resume_url ?? ""),
     },
+    applicationAnswers: toApplicationAnswers(candidate as Record<string, unknown>),
   };
 }
 
@@ -1534,6 +1701,788 @@ async function fillFields(
   return outcomes;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ACT-015 — every other field on the form
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Everything above this line fills the eight fields ACT-007 knew by name.
+// Everything below fills whatever else the form turned out to have, through the
+// perception → decision → action split described in this file's header.
+
+/** Kinds whose value is chosen from a list rather than typed. */
+const OPTION_KINDS: ReadonlySet<FormFieldKind> = new Set(["select", "combobox", "radio"]);
+
+/**
+ * How many free-text answers one form may have written for it.
+ *
+ * A bound rather than a policy: each one is a paid model call, and a form asking
+ * for more than three essays is a form a human should be looking at anyway.
+ */
+const MAX_GENERATED_ANSWERS = 3;
+
+/** Countries whose name means "the US" for the purpose of a derived fact. */
+const US_COUNTRY_RE = /^(the\s+)?(united\s+states(\s+of\s+america)?|u\.?s\.?a?\.?|america)$/i;
+
+/**
+ * Everything this system is willing to state about the candidate, as a closed
+ * list, with a key per entry.
+ *
+ * This is the mechanical form of "never guess". The decision call may only
+ * `answer` a field by naming one of these keys, and the value it returns is then
+ * checked against that entry's value here — so an answer that is not traceable
+ * to something a human told us, or to something the resume actually said and
+ * `sanitize*()` accepted, cannot reach a real employer's form. A short
+ * catalogue is therefore a *feature*: it is the exact set of assertions we are
+ * entitled to make, and everything outside it becomes a question.
+ */
+function buildFactCatalog(
+  profile: ResumeProfile,
+  answers: CandidateApplicationAnswers,
+  additionalAnswers: Record<string, string>
+): CandidateFact[] {
+  const facts: CandidateFact[] = [];
+  const add = (key: string, label: string, value: string | null | undefined): void => {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text !== "") facts.push({ key, label, value: text });
+  };
+  const yesNo = (value: boolean | undefined): string | null =>
+    value === undefined ? null : value ? "Yes" : "No";
+
+  add("firstName", "First name", profile.firstName);
+  add("lastName", "Last name", profile.lastName);
+  add(
+    "fullName",
+    "Full name",
+    [profile.firstName, profile.lastName].filter(Boolean).join(" ") || null
+  );
+  add("email", "Email address", profile.email);
+  add("phone", "Phone number", profile.phone);
+  add("linkedinUrl", "LinkedIn profile URL", profile.linkedinUrl);
+  add("websiteUrl", "Personal website / portfolio URL", profile.websiteUrl);
+  add("resumeLocation", "Location printed on their resume", profile.location);
+
+  add("currentCountry", "Country they currently live in", answers.currentCountry);
+  add("currentCity", "City they currently live in", answers.currentCity);
+  add(
+    "workAuthorizedUs",
+    "Legally authorized to work in the United States",
+    yesNo(answers.workAuthorizedUs)
+  );
+  add(
+    "requiresSponsorship",
+    "Will now or in future require visa sponsorship",
+    yesNo(answers.requiresSponsorship)
+  );
+  add("willingToRelocate", "Willing to relocate for a role", yesNo(answers.willingToRelocate));
+
+  // Derived, in TypeScript rather than by a model: "they live in the United
+  // States" entails "they are currently located in the US". That is an
+  // entailment, not an inference about a person, and boards ask it as often as
+  // they ask for the country itself.
+  if (answers.currentCountry !== undefined) {
+    add(
+      "locatedInUs",
+      "Currently located in the United States (from the country they gave)",
+      US_COUNTRY_RE.test(answers.currentCountry.trim()) ? "Yes" : "No"
+    );
+  }
+
+  const job = profile.workHistory[0];
+  if (job !== undefined) {
+    add("mostRecentEmployer", "Most recent employer", job.company);
+    add("mostRecentTitle", "Most recent job title", job.title);
+  }
+  const school = profile.education[0];
+  if (school !== undefined) {
+    add("school", "Most recent school", school.school);
+    add("degree", "Most recent degree", school.degree);
+    add("discipline", "Field of study", school.discipline);
+  }
+
+  // The user's own answers from a previous `needsInput` round. Highest-quality
+  // facts in the catalogue — they came from the person themselves — and keyed by
+  // the form label they answered, so a differently-worded field asking the same
+  // thing can still be matched to one.
+  for (const [key, value] of Object.entries(additionalAnswers)) {
+    add(`answer:${key}`, `The candidate's own answer to "${key}"`, value);
+  }
+
+  return facts;
+}
+
+/**
+ * The user's answer for this field, when they gave one.
+ *
+ * Matching is generous in one direction only: an answer key must *contain or be
+ * contained by* the field's key, and only for keys long enough for that to mean
+ * something. That way "are you legally authorized to work in the united states
+ * for our company?" is answered by the shorter question a caller echoed back,
+ * while two unrelated one-word labels can never collide.
+ */
+function matchAdditionalAnswer(
+  field: EnumeratedField,
+  additionalAnswers: Record<string, string>
+): string | null {
+  const wanted = normalizeText(field.key);
+  const label = normalizeText(field.label);
+
+  for (const [key, value] of Object.entries(additionalAnswers)) {
+    const candidate = normalizeText(key);
+    if (candidate === "" || value.trim() === "") continue;
+    if (candidate === wanted || candidate === label) return value.trim();
+  }
+  for (const [key, value] of Object.entries(additionalAnswers)) {
+    const candidate = normalizeText(key);
+    if (candidate.length < 10 || value.trim() === "") continue;
+    if (wanted.includes(candidate) || candidate.includes(wanted)) return value.trim();
+  }
+  return null;
+}
+
+/**
+ * Does choosing this option say what the stored fact says?
+ *
+ * Boards word their options and this system words its facts, and the two rarely
+ * match character for character: Greenhouse's phone-country list offers
+ * `"United States +1"` for a stored `"United States"`, and a work-authorization
+ * dropdown may offer `"Yes, I am authorized to work in the US"` for a stored
+ * `"Yes"`. Both are the same statement. `"Now hiring"` for a stored `"No"` is
+ * not, which is why a short fact has to match at a word boundary rather than
+ * anywhere in the string — the check exists precisely so that naming a fact
+ * cannot license clicking an unrelated option.
+ */
+function optionSupportsFact(option: string, factValue: string): boolean {
+  const chosen = normalizeText(option);
+  const known = normalizeText(factValue);
+  if (chosen === known) return true;
+  if (known.length <= 3) {
+    return chosen.startsWith(`${known} `) || chosen.startsWith(`${known},`);
+  }
+  // At a word boundary, not anywhere in the string. A raw substring test reads
+  // "British Indian Ocean Territory" as supporting a stored "India", "South
+  // Georgia and the South Sandwich Islands" as supporting "Georgia", and "South
+  // Korea" as supporting "Korea" — all verified against this function before the
+  // boundary was added. Country menus are exactly where that bites, and picking
+  // the wrong country on a work-authorization form is a false statement, not a
+  // typo.
+  return containsAtWordBoundary(chosen, known) || containsAtWordBoundary(known, chosen);
+}
+
+/** Whether `needle` appears in `haystack` delimited by non-word characters. */
+function containsAtWordBoundary(haystack: string, needle: string): boolean {
+  if (needle === "") return false;
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) return false;
+    const before = at === 0 ? "" : haystack[at - 1]!;
+    const afterAt = at + needle.length;
+    const after = afterAt >= haystack.length ? "" : haystack[afterAt]!;
+    const boundedLeft = before === "" || !/[a-z0-9]/i.test(before);
+    const boundedRight = after === "" || !/[a-z0-9]/i.test(after);
+    if (boundedLeft && boundedRight) return true;
+    from = at + 1;
+  }
+}
+
+/**
+ * A yes/no answer as a boolean, or null when the text states neither. The
+ * vocabulary matches `setCheckbox`'s in `form-fields.ts` deliberately: the
+ * policy layer and the action layer must agree on what "yes" looks like, or a
+ * value this accepts could be rejected there (or worse, vice versa).
+ */
+function booleanAnswer(text: string): boolean | null {
+  const normalized = normalizeText(text);
+  if (["yes", "true", "checked", "check", "on", "1", "agree", "i agree", "y"].includes(normalized)) {
+    return true;
+  }
+  if (["no", "false", "unchecked", "uncheck", "off", "0", "n"].includes(normalized)) return false;
+  return null;
+}
+
+/** What the policy decided to do with one field, once every check has run. */
+type Resolution =
+  | { kind: "apply"; value: string; declined: boolean; note: string }
+  | { kind: "generate"; note: string }
+  | { kind: "ask"; question: string; why: string }
+  | { kind: "skip"; why: string };
+
+function askAbout(field: EnumeratedField, why: string, question?: string | null): Resolution {
+  const asked =
+    question !== null && question !== undefined && question.trim() !== ""
+      ? question.trim()
+      : field.label === ""
+        ? "This field has no visible label — what should go in it?"
+        : `The form asks: "${field.label}". What should we put?`;
+  return { kind: "ask", question: asked, why };
+}
+
+/** A field left blank blocks the board's own validation; an optional one does not. */
+function askOrSkip(field: EnumeratedField, why: string, question?: string | null): Resolution {
+  return field.required ? askAbout(field, why, question) : { kind: "skip", why };
+}
+
+/**
+ * The answering policy, enforced.
+ *
+ * `decideFieldAnswers` states the same rules to the model in English; this
+ * function is what happens when the model does not follow them, and it is the
+ * half that actually holds. Note the order: the demographic rule is checked
+ * *first* and unconditionally, before the model's own decision is even read, so
+ * a "Gender" select can only ever be declined, asked about, or left alone — no
+ * output from any model can put an identity in it.
+ */
+function resolveDecision(
+  field: EnumeratedField,
+  decision: FieldDecision | undefined,
+  facts: ReadonlyMap<string, CandidateFact>
+): Resolution {
+  // ── Demographic and self-identification questions ────────────────────────
+  if (EEO_FIELD_RE.test(field.label)) {
+    if (!field.required) {
+      return {
+        kind: "skip",
+        why:
+          "an optional self-identification question — left blank, which is the same answer " +
+          "as declining and needs no control on the page",
+      };
+    }
+    const decline = findDeclineOption(field.options);
+    if (decline !== null) {
+      return {
+        kind: "apply",
+        value: decline,
+        declined: true,
+        note:
+          "a required self-identification question, answered by declining to self-identify — " +
+          "the only truthful answer available without asserting a demographic identity",
+      };
+    }
+    return askAbout(
+      field,
+      field.optionsKnown
+        ? "a required self-identification question whose options include no way to decline, " +
+          "and a demographic identity will never be invented for a real person"
+        : "a required self-identification question whose options could not be read, so the " +
+          "decline option could not be found",
+      `The form requires an answer to "${field.label}" and offers no "decline to answer" ` +
+        `option. What would you like to put, if anything?`
+    );
+  }
+
+  // ── Agreements, consents and certifications ──────────────────────────────
+  if (field.kind === "checkbox" && CONSENT_FIELD_RE.test(field.label)) {
+    return askAbout(
+      field,
+      "this box records an agreement or a certification, which is a commitment made in the " +
+        "candidate's name and is never ticked on their behalf",
+      `The form has a box to tick: "${field.label}". Do you agree to it?`
+    );
+  }
+
+  if (decision === undefined) {
+    return askOrSkip(field, "no decision was returned for this field");
+  }
+
+  switch (decision.decision) {
+    case "generate": {
+      if (field.kind !== "textarea") {
+        return askOrSkip(
+          field,
+          `a written answer was proposed for a ${field.kind} control, which is not somewhere ` +
+            `prose belongs`,
+          decision.question
+        );
+      }
+      if (!field.required) {
+        return {
+          kind: "skip",
+          why: "an optional free-text box — left blank rather than filled with unasked-for prose",
+        };
+      }
+      return { kind: "generate", note: decision.why };
+    }
+
+    case "answer": {
+      const value = decision.value?.trim() ?? "";
+      if (value === "") return askOrSkip(field, "an answer was proposed with no value in it");
+
+      const fact = decision.sourceFact === null ? undefined : facts.get(decision.sourceFact);
+      if (fact === undefined) {
+        return askOrSkip(
+          field,
+          `an answer was proposed without naming a known fact to back it ` +
+            `(${JSON.stringify(decision.sourceFact ?? "none")}), and nothing factual about a ` +
+            `real person is asserted on a real application without one`,
+          decision.question
+        );
+      }
+
+      if (OPTION_KINDS.has(field.kind)) {
+        if (field.optionsKnown && field.options.length > 0) {
+          const match = field.options.find((option) => normalizeText(option) === normalizeText(value));
+          if (match === undefined) {
+            return askOrSkip(
+              field,
+              `"${value}" is not one of the options this control offers`,
+              decision.question
+            );
+          }
+          if (!optionSupportsFact(match, fact.value)) {
+            return askOrSkip(
+              field,
+              `the option ${JSON.stringify(match)} does not say what the stored fact ` +
+                `"${fact.key}" says (${JSON.stringify(fact.value)}), so choosing it would be a ` +
+                `different statement from the one this system was told`,
+              decision.question
+            );
+          }
+          return {
+            kind: "apply",
+            value: match,
+            declined: false,
+            note: `chosen from the control's own options, from the stored fact "${fact.key}"`,
+          };
+        }
+        // The list was not read. The action layer will only click an option that
+        // is literally on the menu, so an invented value fails there instead of
+        // here — which is the same outcome, one step later.
+        return {
+          kind: "apply",
+          value,
+          declined: false,
+          note:
+            `proposed from the stored fact "${fact.key}"; the control's options were not read ` +
+            `in advance, so this is matched against the live list before anything is clicked`,
+        };
+      }
+
+      if (field.kind === "checkbox") {
+        // A checkbox is a yes/no assertion, so the check that belongs here is
+        // the boolean one: does ticking (or leaving) this box say what the
+        // stored fact says? Without it this branch was the one place a
+        // fact-backed answer skipped verification entirely — a model could cite
+        // a real `willingToRelocate = "No"` and propose "Yes", and the read-back
+        // would happily confirm the box it was just told to tick. No injection
+        // needed for that, only an ordinary slip, and the result is a false
+        // statement about work authorization or relocation sitting on a real
+        // employer's form.
+        const proposed = booleanAnswer(value);
+        const backed = booleanAnswer(fact.value);
+        if (proposed === null) {
+          return askOrSkip(
+            field,
+            `${JSON.stringify(value.slice(0, 40))} is neither a yes nor a no, and a checkbox ` +
+              `can only state one or the other`,
+            decision.question
+          );
+        }
+        if (backed === null) {
+          return askOrSkip(
+            field,
+            `the stored fact "${fact.key}" (${JSON.stringify(fact.value.slice(0, 40))}) is not a ` +
+              `yes or a no, so it cannot say whether this box should be ticked`,
+            decision.question
+          );
+        }
+        if (proposed !== backed) {
+          return askOrSkip(
+            field,
+            `ticking this box would state ${proposed ? '"yes"' : '"no"'}, but the stored fact ` +
+              `"${fact.key}" says ${JSON.stringify(fact.value.slice(0, 40))} — the opposite of ` +
+              `what this system was told, and not something to assert on a real application`,
+            decision.question
+          );
+        }
+        return {
+          kind: "apply",
+          value,
+          declined: false,
+          note: `from the stored fact "${fact.key}"`,
+        };
+      }
+
+      // A typed field. The value must be the fact itself or a part of it —
+      // "San Francisco" out of "San Francisco, CA" is a narrowing, while
+      // anything the fact does not contain is new text about a real person.
+      const wanted = normalizeText(value);
+      const known = normalizeText(fact.value);
+      if (wanted !== known && !known.includes(wanted)) {
+        return askOrSkip(
+          field,
+          `the proposed answer ${JSON.stringify(value.slice(0, 80))} is not what the stored ` +
+            `fact "${fact.key}" says (${JSON.stringify(fact.value.slice(0, 80))}), so it would ` +
+            `be new information about the candidate rather than a report of it`,
+          decision.question
+        );
+      }
+      return {
+        kind: "apply",
+        value,
+        declined: false,
+        note: `typed from the stored fact "${fact.key}"`,
+      };
+    }
+
+    case "decline": {
+      const value = decision.value?.trim() ?? "";
+      const match = field.options.find(
+        (option) => normalizeText(option) === normalizeText(value)
+      );
+      // `DECLINE_OPTION_RE` rather than a looser local pattern, and the
+      // difference matters: a pattern that merely looked for "not" would accept
+      // "I am not a protected veteran" as a refusal to answer. That is not a
+      // refusal, it is an assertion about a real person, and it is exactly the
+      // kind of thing this system must never make on their behalf.
+      if (match === undefined || !DECLINE_OPTION_RE.test(match)) {
+        return askOrSkip(
+          field,
+          `a "prefer not to answer" option was proposed but the control does not offer one ` +
+            `matching ${JSON.stringify(value.slice(0, 60))}`,
+          decision.question
+        );
+      }
+      return {
+        kind: "apply",
+        value: match,
+        declined: true,
+        note: "answered by declining, using the control's own decline option",
+      };
+    }
+
+    case "ask":
+      return askAbout(
+        field,
+        decision.why || "nothing known about the candidate answers this",
+        decision.question
+      );
+
+    case "skip":
+    default:
+      return askOrSkip(field, decision.why || "nothing known about the candidate answers this");
+  }
+}
+
+type RemainingFieldsResult = {
+  outcomes: FieldOutcome[];
+  needsInput: NeedsInputItem[];
+};
+
+/**
+ * Perception → decision → action, over every field the named-field pass did not
+ * already fill.
+ *
+ * Ordering inside here is not incidental:
+ *
+ *  1. Read the whole form. Nothing is decided yet and no model has seen it.
+ *  2. Drop anything already carrying a value. That is what keeps this from
+ *     re-typing over the eight fields above and over anything the board itself
+ *     pre-filled, without needing to know which selectors those were.
+ *  3. Apply the user's own answers first, deterministically. A question they
+ *     have already answered is not a question, and no model needs to be asked
+ *     about it again.
+ *  4. Open the dropdowns that block submission, so the decision sees the real
+ *     option strings rather than guessing at wording.
+ *  5. One tool-free decision call over what is left.
+ *  6. Enforce the policy in TypeScript, then act, then read back.
+ */
+async function fillRemainingFields(
+  session: BrowserSession,
+  state: ApplicationState,
+  profile: ResumeProfile,
+  jobDescription: string | null,
+  additionalAnswers: Record<string, string>
+): Promise<RemainingFieldsResult> {
+  const outcomes: FieldOutcome[] = [];
+  const needsInput: NeedsInputItem[] = [];
+
+  const all = await enumerateFormFields(session.page);
+  console.log(`${LOG} the form has ${all.length} readable control(s)`);
+
+  const empty = all.filter(
+    (field) =>
+      field.currentValue === "" &&
+      field.kind !== "file" &&
+      field.kind !== "other" &&
+      field.label !== ""
+  );
+  if (empty.length === 0) {
+    return { outcomes, needsInput };
+  }
+  console.log(
+    `${LOG} ${empty.length} control(s) still empty: ` +
+      empty.map((field) => `${field.label}${field.required ? "*" : ""}`).join(", ")
+  );
+
+  const facts = buildFactCatalog(profile, state.applicationAnswers, additionalAnswers);
+  const factsByKey = new Map(facts.map((fact) => [fact.key, fact]));
+
+  const record = (
+    field: EnumeratedField,
+    outcome: FieldOutcome["outcome"],
+    intended: string | null,
+    detail: string,
+    readBack?: string | null
+  ): void => {
+    outcomes.push({
+      field: field.key,
+      intended,
+      outcome,
+      detail: `${field.required ? "required — " : ""}${detail}`,
+      ...(readBack === undefined ? {} : { readBack }),
+    });
+  };
+
+  const ask = (field: EnumeratedField, question: string, why: string): void => {
+    needsInput.push({
+      key: field.key,
+      fieldLabel: field.label,
+      question,
+      why,
+      required: field.required,
+      kind: field.kind,
+      ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
+    });
+    record(field, "needs-input", null, `left blank and escalated — ${why}`);
+    console.warn(`${LOG} needs the candidate: ${field.label} — ${why}`);
+  };
+
+  // ── Step 3: the user's own answers, applied without a model ──────────────
+  const undecided: EnumeratedField[] = [];
+  for (const field of empty) {
+    const supplied = matchAdditionalAnswer(field, additionalAnswers);
+    if (supplied === null) {
+      undecided.push(field);
+      continue;
+    }
+
+    // `additionalAnswers` is meant to be the candidate's own words, relayed
+    // after a previous run asked them something. But it arrives through the
+    // orchestrating model (see `toAdditionalAnswers` in `mcp-server/index.ts`),
+    // which could equally volunteer an entry nobody was asked for — and this
+    // step runs before `resolveDecision`, so the EEO rule that governs the
+    // model-decision path does not cover it.
+    //
+    // A demographic field is only ever escalated when it is required AND offers
+    // no way to decline; anything else auto-declines and is never asked about.
+    // So an answer supplied for a demographic field that *does* offer a decline
+    // option was not responsive to a question this system asked, and is
+    // therefore not something to state about a real person's identity. Let the
+    // decline path below handle it instead.
+    if (EEO_FIELD_RE.test(field.label) && findDeclineOption(field.options) !== null) {
+      undecided.push(field);
+      console.warn(
+        `${LOG} ignoring a supplied answer for the demographic field "${field.label}" — it ` +
+          `offers a decline option, so it was never asked about, and an unsolicited answer ` +
+          `here would be stating an identity nobody gave`
+      );
+      continue;
+    }
+    // `allowContains` for a dropdown here, unlike on the decided path: a person
+    // answering "Yes" in chat should land on an option worded "Yes, I am
+    // authorized to work in the US". Still only when exactly one option contains
+    // what they said — see `chooseFromMenu` — so an ambiguous answer comes back
+    // to them rather than being resolved for them.
+    const outcome = await applyFieldValue(session.page, field, supplied, {
+      allowContains: OPTION_KINDS.has(field.kind),
+    });
+    if (outcome.ok) {
+      record(field, "filled", supplied, `answered by the candidate — ${outcome.detail}`, outcome.readBack);
+      console.log(`${LOG} ${field.label}: filled from the candidate's own answer`);
+    } else if (outcome.readBack !== "") {
+      record(field, "mismatch", supplied, outcome.detail, outcome.readBack);
+    } else {
+      ask(
+        field,
+        `Your answer "${supplied}" could not be used for "${field.label}". ${outcome.detail}. ` +
+          `What should we put instead?`,
+        `the answer supplied did not fit the control — ${outcome.detail}`
+      );
+    }
+  }
+
+  if (undecided.length === 0) return { outcomes, needsInput };
+
+  // ── Step 4: open the dropdowns that stand between this and a submittable
+  // form. Optional ones are left shut: opening every menu on a page costs a
+  // click and a repaint each, and an optional dropdown nobody can answer is
+  // left blank either way.
+  for (const field of undecided) {
+    if (!field.required) continue;
+    if (!OPTION_KINDS.has(field.kind) || field.optionsKnown) continue;
+    const harvested = await harvestOptions(session.page, field);
+    field.options = harvested.options;
+    field.optionsKnown = harvested.options.length > 0;
+    field.optionsTruncated = harvested.truncated;
+    console.log(
+      `${LOG} "${field.label}" offers ${harvested.options.length}` +
+        `${harvested.truncated ? "+" : ""} option(s)`
+    );
+  }
+
+  // ── Step 5: one decision call, no tools attached ─────────────────────────
+  const decidable: DecidableField[] = undecided.map((field) => ({
+    key: field.key,
+    label: field.label,
+    kind: field.kind,
+    required: field.required,
+    options: field.options,
+    optionsKnown: field.optionsKnown,
+    optionsTruncated: field.optionsTruncated,
+    helpText: field.helpText,
+  }));
+
+  const decisions = await decideFieldAnswers({
+    fields: decidable,
+    facts,
+    company: state.company,
+    jobTitle: state.jobTitle,
+    jobDescription,
+  });
+  const byKey = new Map(decisions.map((decision) => [decision.fieldKey, decision]));
+
+  // ── Step 6: policy, then action, then read-back ──────────────────────────
+  let generated = 0;
+  for (const field of undecided) {
+    const resolution = resolveDecision(field, byKey.get(field.key), factsByKey);
+
+    if (resolution.kind === "skip") {
+      record(field, "skipped", null, `left blank — ${resolution.why}`);
+      continue;
+    }
+    if (resolution.kind === "ask") {
+      ask(field, resolution.question, resolution.why);
+      continue;
+    }
+
+    let value: string;
+    let note: string;
+    let declined = false;
+
+    if (resolution.kind === "generate") {
+      if (generated >= MAX_GENERATED_ANSWERS) {
+        ask(
+          field,
+          `The form asks: "${field.label}". What would you like to say?`,
+          `this form asks more than ${MAX_GENERATED_ANSWERS} free-text questions, which is ` +
+            `more than this writes unattended`
+        );
+        continue;
+      }
+      generated++;
+      try {
+        // A model call while a browser is open — unlike the resume parse and the
+        // cover letter, which both run before one exists. The containment that
+        // matters is unchanged and is not about timing: this call is made by
+        // `resume-parser.ts`, which has no browser handle, carries no tools, and
+        // is asserted to carry none immediately before the request is sent. What
+        // comes back is a string, and a string is checked and typed as an
+        // argument; it never becomes an instruction.
+        value = await generateEssayAnswer({
+          profile,
+          company: state.company,
+          jobTitle: state.jobTitle,
+          jobDescription,
+          question: field.label,
+          ...(field.maxLength === null ? {} : { maxChars: field.maxLength }),
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        ask(
+          field,
+          `The form asks: "${field.label}". What would you like to say?`,
+          `an answer could not be written for it (${reason})`
+        );
+        continue;
+      }
+      note = `written from the candidate's validated profile — ${resolution.note}`;
+    } else {
+      value = resolution.value;
+      note = resolution.note;
+      declined = resolution.declined;
+    }
+
+    const outcome = await applyFieldValue(session.page, field, value, {
+      // No fixed option list means this is a search control that answers a
+      // query rather than a menu with a fixed set — see `chooseFromMenu`.
+      allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
+    });
+
+    if (outcome.ok) {
+      record(field, declined ? "declined" : "filled", value, `${note}; ${outcome.detail}`, outcome.readBack);
+      console.log(`${LOG} ${field.label}: ${declined ? "declined to answer" : "filled"} + verified`);
+      continue;
+    }
+    if (outcome.readBack !== "") {
+      record(field, "mismatch", value, outcome.detail, outcome.readBack);
+      continue;
+    }
+    ask(
+      field,
+      `"${field.label}" could not be set to ${JSON.stringify(value.slice(0, 80))}. ` +
+        `${outcome.detail}. What should we put?`,
+      `the value could not be applied — ${outcome.detail}`
+    );
+  }
+
+  return { outcomes, needsInput };
+}
+
+/**
+ * A field that reads back as something other than what was typed means a real
+ * employer's form now holds a value nobody chose. Lifted out of the flow by
+ * ACT-015 so the named-field pass and the general pass are held to the identical
+ * rule rather than to two copies of it.
+ */
+function assertNoMismatches(fields: readonly FieldOutcome[], url: string): void {
+  const mismatched = fields.filter((field) => field.outcome === "mismatch");
+  if (mismatched.length === 0) return;
+  throw new FormFillBlockedError(
+    `The form at "${url}" was filled, but ${mismatched.length} field(s) read back as ` +
+      `something other than what was typed: ` +
+      mismatched
+        .map((field) => `${field.field} reads ${JSON.stringify(field.readBack ?? "")}`)
+        .join("; ") +
+      `. Nothing was submitted. A human should look at the form before it goes anywhere.`
+  );
+}
+
+/**
+ * The stop that ends a run which could not answer a required question.
+ *
+ * Deliberately shaped as a stop-for-a-human rather than a failure: the form is
+ * genuinely half-filled, the row genuinely cannot be submitted, and the fix is
+ * three sentences from the candidate rather than a retry. `needsInput` carries
+ * the questions; this carries the sentence a person reads.
+ */
+function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: string): FormFillBlockedError {
+  const required = needsInput.filter((item) => item.required);
+  return new FormFillBlockedError(
+    `needs_candidate_input: the form at "${url}" has ${required.length} required field(s) ` +
+      `that cannot be answered truthfully from what is known about this candidate, and this ` +
+      `will not guess at a statement made to a real employer under their name. Everything ` +
+      `else on the form is filled and nothing was submitted.\n\n` +
+      required
+        .map((item, index) => {
+          // Trimmed hard: a country picker offers 250 choices and a person
+          // reading this needs to know it is a picker, not to read the list.
+          const shown = item.options?.slice(0, 8) ?? [];
+          const more = (item.options?.length ?? 0) - shown.length;
+          return (
+            `  ${index + 1}. ${item.fieldLabel} — ${item.question}` +
+            (shown.length === 0
+              ? ""
+              : `\n     options: ${shown.join(" | ")}${more > 0 ? ` | …and ${more} more` : ""}`) +
+            `\n     key: ${item.key}`
+          );
+        })
+        .join("\n") +
+      `\n\nAsk the candidate these questions, then run this again with \`additionalAnswers\` ` +
+      `keyed by the \`key\` shown above. Nothing is stored in between — the same call with the ` +
+      `answers added finishes the form.`
+  );
+}
+
 // ───────────────────────────────────
 // The resume file
 // ───────────────────────────────────
@@ -1555,6 +2504,20 @@ async function attachResume(
   profile: ResumeProfile
 ): Promise<FieldOutcome> {
   const fileName = resumeFileName(profile);
+
+  // Checked here as well as at the download, because this is the last point
+  // before the bytes leave for a real employer and the read-back below cannot
+  // be relied on to notice: Greenhouse renders its form inside an iframe, so
+  // `describeControl` cannot see the control afterwards and the "still reports
+  // no attached file" check silently degrades to "could not confirm". An empty
+  // attachment is worse than a blocked run — a submitted application with no
+  // resume on it cannot be un-sent.
+  if (bytes.byteLength === 0) {
+    throw new FormFillBlockedError(
+      `The resume to attach is 0 bytes. An application with an empty resume attached is worse ` +
+        `than no application, so this stops here. Nothing was submitted.`
+    );
+  }
 
   // The deterministic path first: exactly one file input on the page needs no
   // model at all, and Greenhouse's standard form is exactly that shape once the
@@ -1878,6 +2841,10 @@ async function runBrowserFlow(
     signals: null,
   };
   const fields: FieldOutcome[] = [];
+  // Hoisted for the same reason `fields` is: a blocked stop must still be able
+  // to report the questions it was blocked on, and the commonest blocked stop
+  // this module now has *is* "it needs answers".
+  const needsInput: NeedsInputItem[] = [];
 
   try {
     verification = await completeVerification(supabase, session, state, input.verification);
@@ -1919,21 +2886,10 @@ async function runBrowserFlow(
     const plan = buildFieldPlan(profile, signals, coverLetter);
     fields.push(...(await fillFields(session, signals.url, plan)));
 
-    // A field that reads back as something other than what was typed means a
-    // real employer's form now holds a value nobody chose. The fill is finished
-    // first so the report names every field, and then the run stops: ACT-008
-    // must not submit this, and a retry cannot fix it without a human looking.
-    const mismatched = fields.filter((field) => field.outcome === "mismatch");
-    if (mismatched.length > 0) {
-      throw new FormFillBlockedError(
-        `The form at "${signals.url}" was filled, but ${mismatched.length} field(s) read back ` +
-          `as something other than what was typed: ` +
-          mismatched
-            .map((field) => `${field.field} reads ${JSON.stringify(field.readBack ?? "")}`)
-            .join("; ") +
-          `. Nothing was submitted. A human should look at the form before it goes anywhere.`
-      );
-    }
+    // The fill is finished before this fires so the report names every field,
+    // and then the run stops: ACT-008 must not submit a form holding a value
+    // nobody chose, and a retry cannot fix it without a human looking.
+    assertNoMismatches(fields, signals.url);
 
     if (signals.resumeUploadPresent || signals.fileInputCount > 0) {
       fields.push(await attachResume(session, signals.url, signals, resumeBytes, profile));
@@ -1946,6 +2902,26 @@ async function runBrowserFlow(
       });
     }
 
+    // ── ACT-015: everything the eight named fields above do not cover ───────
+    const remaining = await fillRemainingFields(
+      session,
+      state,
+      profile,
+      input.jobDescription ?? null,
+      input.additionalAnswers ?? {}
+    );
+    fields.push(...remaining.outcomes);
+    needsInput.push(...remaining.needsInput);
+    assertNoMismatches(fields, signals.url);
+
+    // A required field still empty is not a partial success — the board will
+    // refuse the application, so there is nothing here for ACT-008 to submit.
+    // Stopping rather than continuing is what keeps a live session from ever
+    // being handed on for a form that cannot go anywhere.
+    if (needsInput.some((item) => item.required)) {
+      throw blockedForAnswers(needsInput, signals.url);
+    }
+
     // Read the page one last time so the report describes the form as it now
     // stands, and so `submitControlLabels` names the button ACT-008 will need.
     // Nothing below this line touches the page except a screenshot — in
@@ -1953,6 +2929,13 @@ async function runBrowserFlow(
     // the session is being retained, this read is also the *last* state ACT-008
     // will see before it decides what to click, so it has to be a fresh one.
     const final = await readFormSignals(session);
+    // ACT-015 gave this module a second set of clicks — opening dropdowns and
+    // choosing options — so the "did one of our clicks submit this?" check that
+    // has always guarded the apply-click path is applied here too, against the
+    // last read of the page. `form-fields.ts` refuses to click any container
+    // holding a submit control, which is the structural half; this is the
+    // observed half, and neither is redundant with the other.
+    assertNotAlreadySubmitted(final, "the filled form");
     const screenshotPath = await captureFilledForm(
       session,
       state.jobApplicationId,
@@ -1966,6 +2949,7 @@ async function runBrowserFlow(
         submitted: false,
         verification: verificationReport(verification),
         fields,
+        needsInput,
         coverLetter: coverLetterReport(cover, coverLetter, fields),
         parsedProfile: profile,
         profileWarnings: profile.warnings,
@@ -1997,6 +2981,7 @@ async function runBrowserFlow(
         submitted: false,
         verification: verificationReport(verification),
         fields,
+        needsInput,
         coverLetter: coverLetterReport(cover, coverLetter, fields),
         parsedProfile: profile,
         profileWarnings: profile.warnings,

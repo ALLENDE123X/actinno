@@ -87,8 +87,20 @@ const VALUE_FLAGS = [
 ] as const;
 const BOOL_FLAGS = ["--requires-cover-letter", "--keep-browser", "--yes-really-submit"] as const;
 
+/**
+ * Same repeatable `--answer "<key>=<answer>"` as `fill-form-cli.ts`, and here
+ * for the same reason: a form ACT-015 could not answer truthfully comes back as
+ * `needsInput`, and the run that finishes it has to be able to carry those
+ * answers in. Without this flag the only way past a blocked fill was to run
+ * `fill-form` (which has it) and then `submit-application` (which did not) —
+ * two browser sessions to do what one call already supports, since
+ * `submitApplication()` has always accepted `additionalAnswers`.
+ */
+const REPEAT_FLAGS = ["--answer"] as const;
+
 type ValueFlag = (typeof VALUE_FLAGS)[number];
 type BoolFlag = (typeof BOOL_FLAGS)[number];
+type RepeatFlag = (typeof REPEAT_FLAGS)[number];
 
 const USAGE = [
   "Usage: npm run submit-application -- (--application <uuid> | --candidate <uuid> --apply-url <url>)",
@@ -110,10 +122,16 @@ const USAGE = [
   "  --verification-code       verificationCode from ACT-006's event",
   "  --screenshot-dir          where to write the post-submit screenshot",
   "  --fill-screenshot-dir     where ACT-007 writes its filled-form screenshot",
+  "  --answer <key>=<answer>   an answer to something a previous run reported under",
+  "                            \"needs the candidate\". Repeatable, once per question.",
   "  --keep-browser            run Chrome headed (visible) instead of headless",
 ].join("\n");
 
-type ParsedArgs = { values: Map<ValueFlag, string>; flags: Set<BoolFlag> };
+type ParsedArgs = {
+  values: Map<ValueFlag, string>;
+  flags: Set<BoolFlag>;
+  answers: Record<string, string>;
+};
 
 /**
  * Parses `--flag value` and `--flag=value`. Rejects unknown and repeated flags
@@ -123,9 +141,12 @@ type ParsedArgs = { values: Map<ValueFlag, string>; flags: Set<BoolFlag> };
 function parseArgs(argv: string[]): ParsedArgs {
   const values = new Map<ValueFlag, string>();
   const flags = new Set<BoolFlag>();
+  const answers: Record<string, string> = {};
   const isValueFlag = (s: string): s is ValueFlag =>
     (VALUE_FLAGS as readonly string[]).includes(s);
   const isBoolFlag = (s: string): s is BoolFlag => (BOOL_FLAGS as readonly string[]).includes(s);
+  const isRepeatFlag = (s: string): s is RepeatFlag =>
+    (REPEAT_FLAGS as readonly string[]).includes(s);
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
@@ -138,10 +159,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       flags.add(name);
       continue;
     }
-    if (!isValueFlag(name)) {
+    const repeated = isRepeatFlag(name);
+    if (!repeated && !isValueFlag(name)) {
       throw new Error(`Unknown argument: ${token}\n${USAGE}`);
     }
-    if (values.has(name)) throw new Error(`Duplicate argument: ${name}`);
+    if (!repeated && isValueFlag(name) && values.has(name)) {
+      throw new Error(`Duplicate argument: ${name}`);
+    }
 
     let value: string | undefined;
     if (token.startsWith("--") && eq !== -1) {
@@ -149,16 +173,36 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else {
       value = argv[++i];
       // Guard against `--candidate --apply-url x` swallowing the next flag.
-      if (value !== undefined && (isValueFlag(value) || isBoolFlag(value))) {
+      if (
+        value !== undefined &&
+        (isValueFlag(value) || isBoolFlag(value) || isRepeatFlag(value))
+      ) {
         throw new Error(`Missing value for ${name} (got the next flag: ${value})`);
       }
     }
     if (value === undefined || value.trim() === "") {
       throw new Error(`Missing value for ${name}\n${USAGE}`);
     }
-    values.set(name, value);
+
+    if (repeated) {
+      // The first `=` splits; everything after it is the answer, so an answer
+      // containing an `=` survives intact.
+      const split = value.indexOf("=");
+      if (split <= 0) {
+        throw new Error(
+          `--answer takes "<key>=<answer>", where <key> is the \`key\` a previous run ` +
+            `printed under "needs the candidate". Got: ${JSON.stringify(value)}`
+        );
+      }
+      const key = value.slice(0, split).trim();
+      const answer = value.slice(split + 1).trim();
+      if (key === "" || answer === "") throw new Error(`--answer needs both a key and an answer`);
+      answers[key] = answer;
+      continue;
+    }
+    values.set(name as ValueFlag, value);
   }
-  return { values, flags };
+  return { values, flags, answers };
 }
 
 /** Never let a credential reach stdout/stderr, even inside a wrapped error. */
@@ -246,7 +290,7 @@ function printReport(result: SubmitApplicationResult): void {
 }
 
 async function main(): Promise<void> {
-  const { values, flags } = parseArgs(process.argv.slice(2));
+  const { values, flags, answers } = parseArgs(process.argv.slice(2));
 
   if (!flags.has("--yes-really-submit")) {
     throw new Error(
@@ -284,6 +328,7 @@ async function main(): Promise<void> {
       code: values.get("--verification-code") ?? null,
     },
     headless: !flags.has("--keep-browser"),
+    ...(Object.keys(answers).length === 0 ? {} : { additionalAnswers: answers }),
     ...(values.get("--screenshot-dir") === undefined
       ? {}
       : { screenshotDir: values.get("--screenshot-dir")! }),

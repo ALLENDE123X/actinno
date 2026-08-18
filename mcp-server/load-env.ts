@@ -22,7 +22,8 @@
  * Now the repo's own `.env.local` is the single source for it.
  */
 
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { config } from "dotenv";
@@ -42,10 +43,34 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const localEnv = config({ path: resolve(__dirname, "../.env.local"), quiet: true });
 config({ path: resolve(__dirname, "../.env"), quiet: true });
 
-if (localEnv.error) {
+/**
+ * ACT-013: a third location, `~/.actinno-mcp/.env.local`, checked last.
+ *
+ * The two paths above are relative to *this file*, and in the deployment that
+ * matters this file is `~/.actinno-mcp/server.mjs` — so they resolve to
+ * `~/.env.local` and `~/.env`, which do not exist. Until ACT-013 that only cost
+ * a warning, because the one variable the server needed (`APIFY_API_TOKEN`) was
+ * being passed in the Claude Desktop config's `env` block. Intake and the
+ * email-to-candidate lookup need `SUPABASE_URL` and
+ * `SUPABASE_SERVICE_ROLE_KEY` too, and a service-role key is not something to
+ * paste into a JSON config as the only option on offer.
+ *
+ * `~/.actinno-mcp/` is the directory the sandbox demonstrably reads — the bundle
+ * is loaded from it — so `cp .env.local ~/.actinno-mcp/.env.local` makes the
+ * whole repo environment available to the bundled server with nothing
+ * duplicated by hand. It is loaded *after* the repo's own files so that a
+ * developer running `npm start` from the checkout still gets the live
+ * `.env.local` rather than whatever was last copied out; dotenv never
+ * overwrites, so first readable file wins and the real process environment
+ * (Claude Desktop's `env` block) beats all three.
+ */
+const bundleEnv = config({ path: join(homedir(), ".actinno-mcp", ".env.local"), quiet: true });
+
+if (localEnv.error && bundleEnv.error) {
   // stderr on purpose — see the note on stdout above.
   console.warn(
-    "[act-010] No readable ../.env.local — relying on the ambient environment for " +
-      "APIFY_API_TOKEN and INNGEST_DEV."
+    "[act-010] No readable ../.env.local or ~/.actinno-mcp/.env.local — relying on the " +
+      "ambient environment for APIFY_API_TOKEN, INNGEST_DEV, SUPABASE_URL and " +
+      "SUPABASE_SERVICE_ROLE_KEY."
   );
 }

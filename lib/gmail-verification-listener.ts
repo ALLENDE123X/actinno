@@ -497,12 +497,34 @@ const VERIFICATION_INTENT_RE =
  * *is* a code — a bare six-digit run in a mail body is as likely to be a
  * requisition id as a one-time code.
  */
-const CODE_PATTERNS: readonly RegExp[] = [
-  /\b(?:verification|confirmation|security|activation|one[-\s]?time|login|sign[-\s]?in)\s+code\b[\s\S]{0,60}?\b([0-9]{4,8})\b/i,
-  /\b(?:verification|confirmation|security|activation|one[-\s]?time)\s+code\b[\s\S]{0,60}?\b([A-Z0-9]{4,10})\b/i,
-  /\bcode\s*(?:is|:)\s*\b([0-9]{4,8})\b/i,
-  /\byour\s+code\b[\s\S]{0,30}?\b([0-9]{4,8})\b/i,
-];
+/**
+ * Anchor, then window, then token — rather than one regex spanning all three.
+ *
+ * A single pattern of the form `code\b[\s\S]{0,60}?\b(TOKEN)\b` cannot work,
+ * and the reason is worth recording because it looks correct: the lazy
+ * quantifier stops at the *nearest* token, and once the overall match succeeds
+ * the engine never backtracks to consider a later one. Since the "…code"
+ * prefix occurs once, scanning further matches finds nothing either. Real mail
+ * puts ordinary words between the phrase and the code, so the nearest token is
+ * routinely the wrong one.
+ *
+ * Measured on the actual Greenhouse mail from this pipeline's first real
+ * submission — "Copy and paste this code into the security code field on your
+ * application: uMO4xvqA" — the old form captured "field", rejected it for
+ * carrying no digit, and returned nothing at all.
+ */
+const CODE_ANCHOR_RE =
+  /\b(?:verification|confirmation|security|activation|one[-\s]?time|login|sign[-\s]?in)\s+code\b|\bcode\s*(?:is\b|:)|\byour\s+code\b/gi;
+
+/** How far past the announcing phrase a code may sit. */
+const CODE_WINDOW_CHARS = 80;
+
+/**
+ * Shape of a code token. Deliberately accepts letters, because boards issue
+ * mixed-case alphanumeric codes (Greenhouse's are 8 characters); the digit
+ * requirement at the call site is what separates a code from a word.
+ */
+const CODE_TOKEN_RE = /\b([A-Za-z0-9]{4,10})\b/g;
 
 const URL_RE = /https?:\/\/[^\s<>"'`\])]+/gi;
 
@@ -533,17 +555,21 @@ export function extractVerification(
 ): Extraction {
   const prose = `${subject}\n${text}\n${htmlToText(html)}`;
 
+  // Each phrase that announces a code, in the order they appear, and for each
+  // the first token after it that carries a digit. A subject line like
+  // "Security code for your application to Discord" is itself an anchor whose
+  // window holds no code — so a fruitless anchor moves on to the next rather
+  // than ending the search.
   let code: string | null = null;
-  for (const pattern of CODE_PATTERNS) {
-    const match = pattern.exec(prose);
-    const candidate = match?.[1];
-    // Second pattern is alphanumeric and case-insensitive (real emails write
-    // "Verification Code", not the lowercase-only literal the pattern used to
-    // require); require a digit so it still cannot latch onto an ordinary word
-    // following "verification code".
-    if (candidate && /[0-9]/.test(candidate)) {
-      code = candidate;
-      break;
+  scan: for (const anchor of prose.matchAll(CODE_ANCHOR_RE)) {
+    const from = (anchor.index ?? 0) + anchor[0].length;
+    const window = prose.slice(from, from + CODE_WINDOW_CHARS);
+    for (const token of window.matchAll(CODE_TOKEN_RE)) {
+      const candidate = token[1];
+      if (candidate !== undefined && /[0-9]/.test(candidate)) {
+        code = candidate;
+        break scan;
+      }
     }
   }
 

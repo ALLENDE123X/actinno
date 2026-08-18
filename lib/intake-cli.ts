@@ -38,12 +38,53 @@ const FLAGS = [
   "--title",
   "--pay-min",
   "--locations",
+  // ACT-015. The reusable answers every ATS form asks for. Collected once here
+  // so no application has to stop and ask for them; each is genuinely optional,
+  // and leaving one out means "not stated", never "no".
+  "--work-authorized-us",
+  "--requires-sponsorship",
+  "--country",
+  "--city",
+  "--willing-to-relocate",
 ] as const;
 type Flag = (typeof FLAGS)[number];
 
-const USAGE =
-  "Usage: npm run intake -- --resume <path-to-pdf> --email <email> " +
-  "[--linkedin <url>] [--title <title>] [--pay-min <integer>] [--locations <csv>]";
+const USAGE = [
+  "Usage: npm run intake -- --resume <path-to-pdf> --email <email>",
+  "                        [--linkedin <url>] [--title <title>] [--pay-min <integer>]",
+  "                        [--locations <csv>]",
+  "",
+  "  Application answers (ACT-015) — asked on almost every ATS form, stored once,",
+  "  reused on every application. Omit any you have not been told; omitted means",
+  "  \"not stated\", and a form asking for one will stop and ask rather than guess.",
+  "",
+  "  --work-authorized-us yes|no   legally authorized to work in the US",
+  "  --requires-sponsorship yes|no will now or in future need visa sponsorship",
+  "  --country <name>              country they currently live in, e.g. \"United States\"",
+  "  --city <name>                 city they currently live in, e.g. \"Atlanta\"",
+  "  --willing-to-relocate yes|no  willing to relocate for a role",
+].join("\n");
+
+/**
+ * A yes/no answer, or a refusal to interpret one.
+ *
+ * Deliberately strict, and deliberately without a default. These become
+ * statements a real person makes to a real employer, so "y", "yes", "true" and
+ * "1" are all accepted as yes — and anything this does not recognise is an
+ * error rather than a silent `false`, because a silent `false` here is an
+ * answer nobody gave.
+ */
+function parseYesNo(flag: Flag, raw: string | undefined): boolean | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim().toLowerCase();
+  if (["yes", "y", "true", "t", "1"].includes(value)) return true;
+  if (["no", "n", "false", "f", "0"].includes(value)) return false;
+  throw new Error(
+    `${flag} must be yes or no, got: ${JSON.stringify(raw)}. Leave the flag out entirely if ` +
+      `the candidate has not told you — that is recorded as "not stated", and a form that ` +
+      `asks will stop and ask them rather than assume an answer.`
+  );
+}
 
 /**
  * Parses `--flag value` and `--flag=value`. Rejects unknown flags, repeated
@@ -112,6 +153,29 @@ async function main(): Promise<void> {
 
   const locationsRaw = args.get("--locations");
 
+  // Only the answers actually given are passed: an absent key means "never
+  // asked", which is what the fill layer needs it to mean.
+  const applicationAnswers = {
+    ...(parseYesNo("--work-authorized-us", args.get("--work-authorized-us")) === undefined
+      ? {}
+      : { workAuthorizedUs: parseYesNo("--work-authorized-us", args.get("--work-authorized-us")) }),
+    ...(parseYesNo("--requires-sponsorship", args.get("--requires-sponsorship")) === undefined
+      ? {}
+      : {
+          requiresSponsorship: parseYesNo(
+            "--requires-sponsorship",
+            args.get("--requires-sponsorship")
+          ),
+        }),
+    ...(parseYesNo("--willing-to-relocate", args.get("--willing-to-relocate")) === undefined
+      ? {}
+      : {
+          willingToRelocate: parseYesNo("--willing-to-relocate", args.get("--willing-to-relocate")),
+        }),
+    ...(args.get("--country") === undefined ? {} : { currentCountry: args.get("--country") }),
+    ...(args.get("--city") === undefined ? {} : { currentCity: args.get("--city") }),
+  };
+
   const result = await intakeCandidate({
     resumeFilePath,
     applicationEmail,
@@ -119,6 +183,7 @@ async function main(): Promise<void> {
     targetTitle: args.get("--title"),
     payMin: parsePayMin(args.get("--pay-min")),
     locations: locationsRaw?.split(",").map((s) => s.trim()).filter(Boolean),
+    ...(Object.keys(applicationAnswers).length === 0 ? {} : { applicationAnswers }),
   });
 
   console.log(JSON.stringify(result, null, 2));

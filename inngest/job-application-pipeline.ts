@@ -124,6 +124,18 @@ export type JobSearchRequestedData = {
 export type JobApplicationRequestedData = {
   candidateId: string;
   listing: JobListing;
+  /**
+   * ACT-015. The candidate's own answers to questions a previous attempt could
+   * not answer truthfully — work authorization, current country, and whatever
+   * else a particular board asks that no stored fact covers.
+   *
+   * Optional, and additive to ACT-009's contract on purpose: an event sent
+   * without it behaves exactly as it did before. Its presence is what turns a
+   * run that stopped at `form_fill_blocked` with `needsInput` into one that
+   * finishes, without any state having been kept in between — the caller asked
+   * the person, and re-sends the same event with the answers attached.
+   */
+  additionalAnswers?: Record<string, string>;
 };
 
 // `staticSchema` gives the handlers real types without a runtime validation
@@ -246,6 +258,30 @@ function normalizeListing(raw: JobListing | undefined): JobListing {
     requiresCoverLetter: listing.requiresCoverLetter === true,
     jobDescription: typeof listing.jobDescription === "string" ? listing.jobDescription : null,
   };
+}
+
+/**
+ * ACT-015 — the candidate's answers off the wire, shaped and bounded.
+ *
+ * An event can be hand-written, so this is checked rather than trusted, on the
+ * same reasoning as `normalizeListing` above. Bounded rather than validated:
+ * whether a key names a real field and whether a value is a real option are
+ * questions only the live form can answer, and ACT-007 asks them there. What
+ * this rules out is the shapes that are not answers at all — non-strings,
+ * blanks, and a payload large enough to be something other than a few replies.
+ */
+function normalizeAdditionalAnswers(raw: unknown): Record<string, string> | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string") continue;
+    const trimmedKey = key.trim().slice(0, 200);
+    const trimmedValue = value.trim().slice(0, 2_000);
+    if (trimmedKey === "" || trimmedValue === "") continue;
+    out[trimmedKey] = trimmedValue;
+    if (Object.keys(out).length >= 40) break;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
 }
 
 /**
@@ -400,6 +436,11 @@ export const applyToJob = inngest.createFunction(
   async ({ event, step }) => {
     const candidateId = requireCandidateId(event.data.candidateId);
     const listing = normalizeListing(event.data.listing);
+    // ACT-015. Passed through untouched: these are the candidate's own words,
+    // and every check that matters — does this key name a field on the form, is
+    // this value one of that control's options — can only be made against the
+    // live page, which is ACT-007's job and not this file's.
+    const additionalAnswers = normalizeAdditionalAnswers(event.data.additionalAnswers);
     // What the run *reports*, as opposed to what it works from. The full listing
     // carries up to 8KB of job-description text, and echoing that back into
     // every run's output would triple the size of the run list for no reader's
@@ -526,6 +567,7 @@ export const applyToJob = inngest.createFunction(
           requiresCoverLetter: listing.requiresCoverLetter,
           jobDescription: listing.jobDescription,
           ...(verification === undefined ? {} : { verification }),
+          ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
         });
         // Trimmed for the same reason as `create-account`: the full result nests
         // ACT-007's entire field-by-field report and the parsed resume profile —

@@ -279,6 +279,17 @@ export type SubmitApplicationInput = {
   jobDescription?: string | null;
   /** Code and/or link, for a row still sitting at `awaiting_verification`. Passed to ACT-007. */
   verification?: VerificationInput;
+  /**
+   * ACT-015. The candidate's own answers to whatever a previous run reported in
+   * `fill.needsInput`, passed straight to ACT-007.
+   *
+   * Nothing here interprets them — this module's whole relationship with the
+   * fill is "ACT-007 owns every guard", and a required question left unanswered
+   * simply means `fill.blockedReason` is set and the submit phase is never
+   * reached. Which is correct: a form the board would reject has nothing worth
+   * clicking Submit on.
+   */
+  additionalAnswers?: Record<string, string>;
   /** Run Chrome headless. Default true. */
   headless?: boolean;
   /** Where ACT-007 writes its filled-form screenshot. */
@@ -842,6 +853,9 @@ export async function submitApplication(
     requiresCoverLetter: input.requiresCoverLetter,
     jobDescription: input.jobDescription ?? null,
     ...(input.verification === undefined ? {} : { verification: input.verification }),
+    ...(input.additionalAnswers === undefined
+      ? {}
+      : { additionalAnswers: input.additionalAnswers }),
     ...(input.headless === undefined ? {} : { headless: input.headless }),
     ...(input.fillScreenshotDir === undefined
       ? {}
