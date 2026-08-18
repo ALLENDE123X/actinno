@@ -46,8 +46,25 @@
 /** Apify actor id. Unchanged from ACT-002. */
 const GREENHOUSE_ACTOR = "automation-lab~greenhouse-jobs-scraper";
 
-/** Actor default is 500/company; the demo wants a handful, not a torrent. */
-const DEFAULT_MAX_PER_COMPANY = 10;
+/**
+ * How many of a board's jobs to *fetch* — not how many to apply to. `title` is
+ * a filter applied to this list afterwards, so it can only ever find what this
+ * pulled down, and the actor returns a board's jobs in roughly alphabetical
+ * order rather than by relevance.
+ *
+ * At 10 that made title search useless in a way that looked like "no such jobs
+ * exist": stripe + airbnb returned 20 listings — Acquisition Manager, AMER
+ * Gathering Programs Manager, Business Operations Lead, Compensation Partner,
+ * Creative Producer — of which zero matched "software engineer", because the
+ * sample was the front of the alphabet rather than a search result. A real
+ * board carries hundreds of roles.
+ *
+ * 250 is a whole board for most employers and still well inside the actor's own
+ * 500 default. The thing that actually bounds cost is `MAX_LISTINGS`, which
+ * caps how many listings are ever applied to, and a browser only opens for
+ * those.
+ */
+const DEFAULT_MAX_PER_COMPANY = 250;
 
 /** Hard ceiling on one search's fan-out. `applyToJob` opens a browser per listing. */
 const MAX_LISTINGS = 25;
