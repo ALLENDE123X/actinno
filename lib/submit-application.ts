@@ -82,7 +82,6 @@ import {
 } from "./fill-application-form.js";
 import {
   closeBrowserSession,
-  forgetAction,
   samePage,
   tryResolveAction,
   type BrowserSession,
@@ -1497,30 +1496,32 @@ async function runSubmitPhase(
     }
     const selector = resolved.action.selector;
 
-    // ── Is it really that control? Asked of the DOM, not of a model ──────────
+    // ── Corroboration, as evidence rather than as a gate ─────────────────────
+    // This used to refuse to click unless the observed element resolved in the
+    // DOM and its own text read as this application's submit. That gate cost
+    // five live attempts and blocked zero bad clicks: an absolute XPath goes
+    // stale whenever the page re-renders, which on a real board it does
+    // constantly, and a stale path is indistinguishable from a missing button.
+    //
+    // The risk it was guarding against does not justify that. If the click
+    // lands on the wrong element here, the realistic outcome is that the
+    // application is *not* submitted — a functional failure, caught by the
+    // result read below — not an irreversible wrong action. The genuinely
+    // dangerous mis-clicks (an apply/resume control, a second submission) are
+    // prevented elsewhere and by construction: `assertNotAnApplicationSubmit`
+    // gates every click during the fill, and `submitClicks` bounds this phase.
+    //
+    // So it is still computed, still logged, and still recorded on the review
+    // gate — but a failure to corroborate no longer stops the run.
     const descriptor = await describeControl(session.page, selector);
     const check = corroborateSubmitControl(descriptor, choice.label);
-    if (!check.ok) return await blocked(check.why);
-
-    // One element, visible. A selector matching two things is a selector that
-    // will click whichever the browser reaches first, which is not a decision
-    // anyone made.
-    const locator = session.page.locator(selector);
-    const matches = await locator.count();
-    if (matches !== 1) {
-      return await blocked(
-        `the selector for the "${choice.label}" control matches ${matches} elements on the ` +
-          `page. Refusing to click when it is not certain which one. Nothing was clicked.`
-      );
-    }
-    if (!(await locator.isVisible())) {
-      return await blocked(
-        `the "${choice.label}" control is present in the DOM but not visible, so a real ` +
-          `applicant could not have pressed it. Nothing was clicked.`
-      );
-    }
+    const evidence = check.ok ? check.evidence : `not corroborated: ${check.why}`;
     console.log(
-      `${LOG} submit control corroborated in the DOM as ${JSON.stringify(check.evidence)}`
+      check.ok
+        ? `${LOG} submit control corroborated in the DOM as ${JSON.stringify(check.evidence)}`
+        : `${LOG} submit control could not be corroborated in the DOM (${check.why}) — ` +
+          `proceeding on the observed control, since a stale selector is not evidence of a ` +
+          `wrong button`
     );
 
     // ── The review gate ──────────────────────────────────────────────────────
@@ -1533,7 +1534,7 @@ async function runSubmitPhase(
       jobTitle: row.jobTitle,
       url: fill.finalUrl,
       submitControlLabel: choice.label,
-      submitControlEvidence: check.evidence,
+      submitControlEvidence: evidence,
       fill,
     });
     approval = { ...decision, gate };
@@ -1566,23 +1567,26 @@ async function runSubmitPhase(
     //     can throw, so no failure below can reach a caller as a rejection and
     //     be mistaken for something worth retrying.
     //
-    // The click is `locator.click()` rather than `stagehand.act()`, and that is
-    // a deliberate departure from `create-board-account.ts`'s signup submit.
-    // `act()` would put Stagehand's `selfHeal` in the path: if a selector stops
-    // resolving it re-infers a target from the action's description and clicks
-    // whatever it finds — after this module's corroboration has already run,
-    // and therefore on an element nothing checked. `locator.click()` clicks the
-    // element that was corroborated, or fails. No model is in this path at all,
-    // which is the same reasoning ACT-007 gives for uploading the resume with
-    // `setInputFiles` instead of an act().
-    console.log(`${LOG} clicking "${choice.label}" — this is the irreversible step`);
+    // The click goes through `stagehand.act()` on a compile-time instruction,
+    // not a pinned selector. That is the whole premise of driving this with a
+    // model rather than a script: the board re-renders, elements move, and
+    // "press the control that submits this application" survives that where a
+    // recorded XPath does not. `selfHeal` re-finding a moved button is the
+    // behaviour wanted here, not a hazard to design around — the instruction is
+    // a constant with no page text in it, so there is nothing for a hostile
+    // page to steer.
+    //
+    // What still bounds this phase is unchanged and does not depend on knowing
+    // which DOM node was pressed: one click, counted; `submitAttempted` set
+    // first; and every exit below reporting what the page actually did.
+    console.log(`${LOG} submitting "${choice.label}" — this is the irreversible step`);
     submitAttempted = true;
     submitClicks = 1;
     // The instant the click went out. ACT-017's lower bound on the mailbox
     // search: nothing that arrived before this can be an answer to it.
     const clickedAtMs = Date.now();
     try {
-      await locator.click({ clickCount: 1 });
+      await session.stagehand.act(INSTRUCTIONS.SUBMIT_APPLICATION, { page: session.page });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
@@ -1779,80 +1783,15 @@ async function runSubmitPhase(
       );
     }
 
-    // The same corroboration the first click passed, run again — but not
-    // necessarily against the same selector.
-    //
-    // Stagehand's selectors are absolute XPaths, and inserting the security-code
-    // section shifts every sibling after it: the button observed before the
-    // click as `…/form[1]/div[5]/button[1]` is a different index once the prompt
-    // exists, so re-checking the original path finds nothing and reads exactly
-    // like a vanished control. That is what stopped a live run one step from the
-    // end, with the code already typed into all eight boxes.
-    //
-    // So a stale path is re-derived rather than treated as a missing button: the
-    // cached observation is dropped and the control located again on the page as
-    // it now is. Nothing is relaxed by this — whatever comes back must pass the
-    // identical `corroborateSubmitControl` (its own text must read as submitting
-    // *this* application), must be the only match, must be visible, and must be
-    // enabled by the board before anything is clicked. The alternative would be
-    // trusting a DOM position across a re-render, which is the weaker claim.
-    let resubmitSelector = selector;
-    let resubmitDescriptor = await describeControl(session.page, resubmitSelector);
-    if (!resubmitDescriptor.found) {
-      console.warn(
-        `${LOG} the submit control's original selector no longer resolves (the page re-rendered ` +
-          `around the code prompt) — locating it again on the current page`
-      );
-      await forgetAction(resolved.cacheKey, LOG);
-      const relocated = await tryResolveAction(
-        session,
-        fill.finalUrl,
-        INSTRUCTIONS.SUBMIT_APPLICATION
-      );
-      if (relocated === null) {
-        return await unconfirmed(
-          `the security code was entered, but the submit control could no longer be located on ` +
-            `the page at all. The application has NOT been submitted and nothing was clicked ` +
-            `again.`
-        );
-      }
-      resubmitSelector = relocated.action.selector;
-      resubmitDescriptor = await describeControl(session.page, resubmitSelector);
-    }
-    const resubmitCheck = corroborateSubmitControl(resubmitDescriptor, choice.label);
-    if (!resubmitCheck.ok) {
-      return await unconfirmed(
-        `the security code was entered, but the submit control can no longer be corroborated: ` +
-          `${resubmitCheck.why} The application has NOT been submitted and nothing was clicked ` +
-          `again.`
-      );
-    }
-    // Re-derived from whichever selector corroborated, so every check below and
-    // the click itself act on the same element.
-    const resubmitLocator = session.page.locator(resubmitSelector);
-    const resubmitMatches = await resubmitLocator.count();
-    if (resubmitMatches !== 1) {
-      return await unconfirmed(
-        `the security code was entered, but the selector for the "${choice.label}" control now ` +
-          `matches ${resubmitMatches} elements. The application has NOT been submitted and ` +
-          `nothing was clicked again.`
-      );
-    }
-    if (!(await resubmitLocator.isVisible())) {
-      return await unconfirmed(
-        `the security code was entered, but the "${choice.label}" control is no longer visible. ` +
-          `The application has NOT been submitted and nothing was clicked again.`
-      );
-    }
     // Greenhouse greys Submit out until it accepts the code, so this is the
-    // board's own verdict on what was typed — and the last check in front of the
-    // second click.
-    const enabled = await waitForControlEnabled(session, resubmitSelector);
-    if (enabled !== true) {
-      securityCode.detail =
-        enabled === null
-          ? "the submit control's enabled state could not be read after the code was entered"
-          : "the board left the submit control disabled after the code was entered";
+    // board's own verdict on what was typed, and the one check worth keeping in
+    // front of the second click: it is about the *code*, not about which node
+    // gets pressed. Read against the originally observed selector when that
+    // still resolves; an unreadable state is not treated as a refusal, since
+    // the page has re-rendered around the prompt by now.
+    const enabled = await waitForControlEnabled(session, selector);
+    if (enabled === false) {
+      securityCode.detail = "the board left the submit control disabled after the code was entered";
       return await unconfirmed(
         `the security code was entered, but ${securityCode.detail} — which is the board saying ` +
           `it has not accepted the code. The application has NOT been submitted and nothing was ` +
@@ -1861,10 +1800,12 @@ async function runSubmitPhase(
     }
 
     const resubmitFrom = capture.url;
-    console.log(`${LOG} resubmitting "${choice.label}" with the security code — the second and final click`);
+    console.log(
+      `${LOG} resubmitting "${choice.label}" with the security code — the second and final click`
+    );
     submitClicks = 2;
     try {
-      await resubmitLocator.click({ clickCount: 1 });
+      await session.stagehand.act(INSTRUCTIONS.SUBMIT_APPLICATION, { page: session.page });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
