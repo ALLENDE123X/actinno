@@ -254,7 +254,7 @@ const ACTORS = [
     name: "actinno/bulk-search-job-listings",
     title: "Bulk Job Listings Search",
     description:
-      "Lists open jobs from one or more named Greenhouse company boards, optionally narrowed by job title and location. Call this ONCE per job search — it returns every matched listing across every named company in a single pass. Do not call it per-listing, and do not call it per-company. This is STEP 2 of Actinno: the candidate must already have been through actinno/intake-candidate (step 1) before the listings this returns can be applied to with actinno/apply-to-job (step 3, once per listing). Searching does not require a candidate, so it is fine to run first and onboard after — but nothing can be applied to until intake has happened.",
+      "Lists open jobs from one or more named company job boards, optionally narrowed by job title and location. Which applicant tracking system each company uses — Greenhouse, Lever or Ashby — is detected automatically; you do not need to know it or say it. Call this ONCE per job search — it returns every matched listing across every named company in a single pass. Do not call it per-listing, and do not call it per-company. This is STEP 2 of Actinno: the candidate must already have been through actinno/intake-candidate (step 1) before the listings this returns can be applied to with actinno/apply-to-job (step 3, once per listing). Searching does not require a candidate, so it is fine to run first and onboard after — but nothing can be applied to until intake has happened.",
     inputSchema: {
       type: "object",
       properties: {
@@ -262,7 +262,7 @@ const ACTORS = [
           type: "array",
           items: { type: "string" },
           description:
-            "Greenhouse board slugs to list jobs from, e.g. ['stripe', 'airbnb']. A pasted board URL works too. REQUIRED: this searches named company boards — it cannot discover companies from a job title alone.",
+            "Companies to list jobs from, named by their job-board token — usually just the company name lowercased, e.g. ['stripe', 'airbnb', 'ramp']. A pasted board URL works too and pins the platform. REQUIRED, and it cannot discover companies from a job title alone. **If the person did not name any companies, do not give up and do not ask them to — work out a sensible list yourself first: web-search for employers matching what they asked for (role, industry, location, stage, whatever they said), take 5-15 real company names from the results, and pass those.** Prefer companies likely to run their own job board; this covers Greenhouse, Lever and Ashby, which between them host most startup and tech hiring. If a company is not on any of the three, the call fails and names it rather than silently returning the other companies' jobs — so on that error, drop the ones it named and retry with the rest.",
         },
         title: {
           type: "string",
@@ -272,10 +272,19 @@ const ACTORS = [
         payMin: {
           type: "number",
           description:
-            "Accepted and ignored — the underlying job board API returns no compensation data to filter on.",
+            "Accepted and ignored — Greenhouse publishes no compensation data, so a pay floor could only ever be applied to some of the boards searched, which would be misleading rather than helpful.",
         },
-        locations: { type: "array", items: { type: "string" } },
-        maxPerCompany: { type: "number" },
+        locations: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Keeps only listings whose location contains one of these, matched case-insensitively, e.g. ['Seattle', 'Remote']. Any one matching is enough. Omit for every location.",
+        },
+        maxPerCompany: {
+          type: "number",
+          description:
+            "How many matched listings a single company may contribute, before the overall 25-listing cap. Use it to spread a search across employers; omit for no per-company limit.",
+        },
       },
       required: ["companies"],
     },
@@ -444,6 +453,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "call_actor") {
     const { actor, input } = args as { actor: string; input: Record<string, unknown> };
 
+    try {
+      return await runActor(actor, input);
+    } catch (err) {
+      // Returned as tool content with `isError`, never rethrown.
+      //
+      // A thrown error becomes a JSON-RPC protocol error, and clients render
+      // those generically — Claude Desktop showed "Tool execution failed" with
+      // no body at all. That cost a live run: `apply-to-job` was refusing an
+      // ambiguous `applicationEmail` and saying exactly why, the caller could
+      // not see the reason, assumed the email path was broken, and worked
+      // around it with a candidateId — the identifier ACT-013 exists to remove.
+      //
+      // These messages are written to be read by whoever called: which company
+      // did not resolve, which field was missing, what to run first. Throwing
+      // them away is worse than any of the failures they describe.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[actinno] ${actor} failed: ${reason}`);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `${actor} failed: ${reason}` }],
+      };
+    }
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+});
+
+/** Dispatch, separated so the handler above can put one try/catch around it. */
+async function runActor(actor: string, input: Record<string, unknown>) {
+  {
     switch (actor) {
       case "actinno/create-resume-upload": {
         const result = await createResumeUploadActor(input);
@@ -501,9 +540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown actor: ${actor}`);
     }
   }
-
-  throw new Error(`Unknown tool: ${name}`);
-});
+}
 
 // ───────────────────────────────────
 // Actor implementations

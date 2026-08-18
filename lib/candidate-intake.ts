@@ -625,22 +625,38 @@ export async function findCandidateByEmail(applicationEmail: string): Promise<Ca
   }
 
   if (rows.length > 1) {
-    const described = rows
-      .map((row) => `${String(row.id)} (created ${String(row.created_at ?? "unknown")})`)
-      .sort()
-      .join(", ");
-    throw new Error(
-      `${rows.length} candidates rows share the email ${wanted}, so it does not identify one ` +
-        `person: ${described}. Actinno puts no unique constraint on application_email — ` +
-        `running intake twice for the same address is what produces this — and each row has ` +
-        `its own uploaded resume, so choosing one here would risk applying with the wrong ` +
-        `document. Re-run with \`candidateId\` set to the row you mean.`
+    // Newest wins, loudly.
+    //
+    // This used to refuse outright, on the reasoning that each row carries its
+    // own uploaded resume so picking one risks applying with the wrong
+    // document. The risk is real but the refusal was the wrong answer to it:
+    // one address is one person, re-running intake is the ordinary way to
+    // replace a resume, and their newest row is by definition their current
+    // one. Choosing it is a rule, not a guess.
+    //
+    // It also failed in the worst available way. The refusal surfaced through
+    // MCP as a bare "Tool execution failed" with no body, so the caller could
+    // not see why, assumed the email path was broken, and switched to a
+    // candidateId — which is exactly the identifier ACT-013 exists to stop
+    // people needing. Three rows for one address is not an exotic state either;
+    // it is what testing onboarding three times produces.
+    const older = rows.length - 1;
+    console.warn(
+      `[act-003] ${rows.length} candidates rows share ${wanted}; using the most recently ` +
+        `created one and ignoring ${older} older row(s). If that is wrong, pass candidateId ` +
+        `explicitly — each row has its own uploaded resume.`
     );
   }
 
-  // Exactly one row by the two checks above; the assertion is only there for
-  // the compiler, which cannot see that.
-  return toCandidateRecord(rows[0]!);
+  // Newest first. `created_at` is set by the column default on insert, so it is
+  // present on every row; a row missing it sorts last rather than crashing.
+  const newest = [...rows].sort((a, b) => {
+    const left = Date.parse(String(a.created_at ?? ""));
+    const right = Date.parse(String(b.created_at ?? ""));
+    return (Number.isNaN(right) ? -Infinity : right) - (Number.isNaN(left) ? -Infinity : left);
+  })[0]!;
+
+  return toCandidateRecord(newest);
 }
 
 /**

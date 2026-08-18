@@ -75,6 +75,55 @@ export type OpenBrowserSessionOptions = {
  * pinning either would make concurrent runs collide on the debug port or on
  * Chrome's profile lock.
  */
+/**
+ * How many browsers may be *starting* at once. Not how many may be running.
+ *
+ * Stagehand enforces a hard-coded, non-configurable 60s ceiling on
+ * `create()` — launch plus init. Chrome's cold start is the expensive part of
+ * that and it is almost entirely CPU: five processes racing through startup on
+ * one machine take far longer each than five started in sequence, and past a
+ * point they simply do not make the ceiling.
+ *
+ * That is not hypothetical. A live 5-wide fan-out lost three of five runs to
+ * "Stagehand initialization timed out after 60000ms" and a
+ * `connect ECONNREFUSED`, on an 8-core / 8 GB machine whose 15-minute load
+ * average was 23 at the time. The two that survived went on to fill forms
+ * normally.
+ *
+ * The fix is not fewer applications. Once a browser is up it spends nearly all
+ * its time idle, waiting on the network and on model calls, so five *running*
+ * browsers cost little — it is five *starting* browsers that do. Queueing the
+ * starts keeps `concurrency: { limit: 5 }` in
+ * `inngest/job-application-pipeline.ts` meaning what it says, while never
+ * putting more than this many launches in flight at once.
+ */
+const MAX_CONCURRENT_LAUNCHES = 2;
+
+/** Resolves when a launch slot is free; the returned function gives it back. */
+const launchQueue: Array<() => void> = [];
+let launchesInFlight = 0;
+
+async function acquireLaunchSlot(logTag: string): Promise<() => void> {
+  if (launchesInFlight >= MAX_CONCURRENT_LAUNCHES) {
+    console.log(
+      `${logTag} waiting for a browser-launch slot (${launchesInFlight} starting, ` +
+        `${launchQueue.length} already queued) — starts are serialised so none of them ` +
+        `misses Stagehand's fixed 60s init ceiling`
+    );
+    await new Promise<void>((resolve) => launchQueue.push(resolve));
+  }
+  launchesInFlight++;
+  let released = false;
+  return () => {
+    // Idempotent: the caller releases on both the success and failure paths,
+    // and double-releasing would let the queue outgrow the limit.
+    if (released) return;
+    released = true;
+    launchesInFlight--;
+    launchQueue.shift()?.();
+  };
+}
+
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
@@ -87,7 +136,17 @@ export async function openBrowserSession(
     );
   }
 
-  const browser = await localBrowser.launch({ headless: options.headless });
+  // Held across launch *and* `Stagehand.create()`, because the 60s ceiling
+  // covers both and init is not the cheap half.
+  const releaseLaunchSlot = await acquireLaunchSlot(options.logTag);
+  let browser: Awaited<ReturnType<typeof localBrowser.launch>>;
+  try {
+    browser = await localBrowser.launch({ headless: options.headless });
+  } catch (err) {
+    releaseLaunchSlot();
+    throw err;
+  }
+
   try {
     const stagehand = await Stagehand.create({
       browser,
@@ -107,6 +166,10 @@ export async function openBrowserSession(
     // The browser is ours and nothing else will ever close it.
     await browser.close().catch(() => undefined);
     throw err;
+  } finally {
+    // The slot covers starting, not running: the next launch may begin as soon
+    // as this one is up, however long the flow that owns it then runs for.
+    releaseLaunchSlot();
   }
 }
 
