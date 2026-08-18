@@ -194,9 +194,40 @@ export type ConfirmationCapture = z.infer<typeof ConfirmationSignalsSchema> & {
   title: string;
   /** `document.body.innerText.length` — context for a page that said nothing useful. */
   textLength: number;
+  /**
+   * `CODE_PROMPT_RE` against the page's own rendered text: the board stating it
+   * emailed a code. Independent of `securityCodeRequested`, which is a model's
+   * reading of the same page.
+   */
+  codePromptInText: boolean;
 };
 
 const PAGE_TEXT_LENGTH_SCRIPT = `((document.body && document.body.innerText) || '').trim().length`;
+
+/** The page's own rendered text, capped — read for the code-prompt check below. */
+const PAGE_TEXT_SCRIPT = `((document.body && document.body.innerText) || '').trim().slice(0, 20000)`;
+
+/**
+ * The board saying, in its own words, that it emailed a code and is waiting for
+ * it. Deliberately read off `innerText` rather than asked of a model.
+ *
+ * `securityCodeRequested` was originally the second of the two signals guarding
+ * the resubmit, and it returned **false** on a live Greenhouse page that
+ * displayed "A verification code was sent to <address>. To submit your
+ * application, enter the 8-character code to confirm you're a human." above
+ * eight empty boxes and a greyed-out Submit. The DOM sweep found the boxes; the
+ * model's account of the page did not mention them, and the run stopped.
+ *
+ * A false negative there is safe but useless, and it is the wrong kind of
+ * signal for the job: whether a page contains a sentence is not a judgement
+ * call. The model's answer is still accepted — it costs nothing and may catch a
+ * board that words this differently — but either it or this deterministic read
+ * now satisfies the "the page is asking" half. The other half, an empty
+ * code-shaped control found by `querySelectorAll`, is unchanged and still
+ * required.
+ */
+const CODE_PROMPT_RE =
+  /\b(?:verification|security|confirmation)\s+code\b[\s\S]{0,200}?\b(?:sent|emailed|e-mailed)\b|\b(?:sent|emailed|e-mailed)\b[\s\S]{0,200}?\b(?:verification|security|confirmation)\s+code\b|\benter\s+the\s+\d+[-\s]?character\s+code\b/i;
 
 async function readConfirmation(session: BrowserSession): Promise<ConfirmationCapture> {
   const { stagehand, page } = session;
@@ -205,15 +236,19 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
     ConfirmationSignalsSchema,
     { page }
   );
-  const [url, title, textLength] = await Promise.all([
+  const [url, title, textLength, pageText] = await Promise.all([
     page.url(),
     page.title(),
     page.evaluate(PAGE_TEXT_LENGTH_SCRIPT).then(
       (value) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0),
       () => 0
     ),
+    page.evaluate(PAGE_TEXT_SCRIPT).then(
+      (value) => (typeof value === "string" ? value : ""),
+      () => ""
+    ),
   ]);
-  return { ...data, url, title, textLength };
+  return { ...data, url, title, textLength, codePromptInText: CODE_PROMPT_RE.test(pageText) };
 }
 
 // ───────────────────────────────────
@@ -1587,21 +1622,35 @@ async function runSubmitPhase(
       : "";
 
     // Two independent readings have to agree before a code is even looked for:
-    // a model's account of what the page is asking (`securityCodeRequested`) and
-    // a `document.querySelectorAll` sweep that finds something to type it into.
-    // Either alone is a reason to stop, not a reason to proceed.
+    // the page saying it emailed one, and a `document.querySelectorAll` sweep
+    // finding something to type it into. Either alone is a reason to stop, not
+    // a reason to proceed.
+    //
+    // Both are re-read here rather than taken from `capture`, because the board
+    // renders the prompt asynchronously after the click: on a live run the
+    // sweep found the eight boxes while `capture`'s text — sampled moments
+    // earlier, inside `readConfirmation` — had not yet seen the sentence that
+    // announces them, and the run stopped on its own freshness gap.
     const groups = securityCodeFieldGroups(await enumerateFormFields(session.page));
-    if (!capture.securityCodeRequested || groups.length === 0) {
+    const codePromptNow = await session.page
+      .evaluate(PAGE_TEXT_SCRIPT)
+      .then(
+        (value) => (typeof value === "string" ? CODE_PROMPT_RE.test(value) : false),
+        () => false
+      );
+    const pageAsksForCode =
+      capture.securityCodeRequested || capture.codePromptInText || codePromptNow;
+    if (!pageAsksForCode || groups.length === 0) {
       return await unconfirmed(
         `"${choice.label}" was clicked, but the application form is still on screen at ` +
           `"${capture.url}" with no confirmation of any kind — the board most likely rejected ` +
           `the submission (validation, or an anti-bot check).${errors} ` +
-          (capture.securityCodeRequested
+          (pageAsksForCode
             ? `The page reads as asking for an emailed one-time code, but no empty code field ` +
               `could be found in the DOM to type one into. `
             : groups.length > 0
-              ? `An empty code-shaped field is present but the page does not read as asking for ` +
-                `an emailed code. `
+              ? `An empty code-shaped field is present, but neither the page's own text nor a ` +
+                `read of it says a code was emailed. `
               : "") +
           `"Most likely" is not "certainly", so this is not being retried: a human should look ` +
           `at the board before anything clicks here again.`
